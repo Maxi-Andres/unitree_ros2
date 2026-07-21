@@ -65,7 +65,9 @@ EXECUTOR_HOST = os.environ.get("EXECUTOR_HOST", "0.0.0.0")
 EXECUTOR_PORT = int(os.environ.get("EXECUTOR_PORT", "8090"))
 DEFAULT_ROBOT = os.environ.get("DEFAULT_ROBOT", "go2")
 ROBOT_IP = os.environ.get("ROBOT_IP", "192.168.123.161")  # informational (health/ping)
-SAFE_MODE = _as_bool(os.environ.get("SAFE_MODE"), True)
+# Default OFF. This is only the FALLBACK: each /execute request may carry its own
+# `safe_mode` (the page toggle), which overrides this per request.
+SAFE_MODE = _as_bool(os.environ.get("SAFE_MODE"), False)
 DRY_RUN = _as_bool(os.environ.get("DRY_RUN"), False)
 MOVE_RATE_HZ = float(os.environ.get("MOVE_RATE_HZ", "10"))
 DEFAULT_STEP_S = float(os.environ.get("DEFAULT_STEP_S", "2.0"))
@@ -273,11 +275,14 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": "no executable skill"})
             return
 
-        if SAFE_MODE and skill in go2_commands.DANGEROUS_SKILLS:
+        # Per-request safe_mode (page toggle) overrides the env default when present.
+        req_safe = body.get("safe_mode")
+        effective_safe = req_safe if isinstance(req_safe, bool) else SAFE_MODE
+        if effective_safe and skill in go2_commands.DANGEROUS_SKILLS:
             self._send(403, {"ok": False, "blocked": True, "robot": robot,
                              "skill": skill,
                              "error": f"'{skill}' blocked by SAFE_MODE (acrobatic). "
-                             "Set SAFE_MODE=false to allow."})
+                             "Turn SAFE_MODE off to allow."})
             return
 
         try:
