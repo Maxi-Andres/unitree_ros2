@@ -1,0 +1,123 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Go2 Robot Model (URDF mesh, live joints)1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Reference Grid (ground plane, 1 m cells)
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+      Color: 160; 160; 160
+      Line Style:
+        Value: Lines
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF Coordinate Frames (odom, base, legs)
+      Enabled: true
+      Marker Scale: 0.3
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+      Value: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: Go2 Robot Model (URDF mesh, live joints)
+      Enabled: true
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 1
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Lidar Point Cloud - deskewed (utlidar/cloud_deskewed)
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /utlidar/cloud_deskewed
+      Style: Flat Squares
+      Size (m): 0.03
+      Color Transformer: AxisColor
+      Axis: Z
+      Use rainbow: true
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Lidar Height Map (utlidar/height_map) [disabled by default]
+      Enabled: false
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /utlidar/height_map
+      Style: Flat Squares
+      Size (m): 0.03
+      Color Transformer: AxisColor
+      Value: false
+    - Class: rviz_default_plugins/Odometry
+      Name: Robot Odometry Pose (utlidar/robot_odom)
+      Enabled: true
+      Topic:
+        Depth: 100
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /utlidar/robot_odom
+      Keep: 1
+      Shape:
+        Value: Arrow
+        Color: 255; 85; 0
+        Shaft Length: 0.3
+        Shaft Radius: 0.03
+        Head Length: 0.1
+        Head Radius: 0.06
+      Covariance:
+        Value: false
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: odom
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 4
+      Pitch: 0.4
+      Yaw: 0.8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Target Frame: base
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false
+  Height: 900
+  Width: 1400
