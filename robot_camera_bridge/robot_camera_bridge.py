@@ -87,10 +87,14 @@ class CameraBridge:
             self._ws = websocket.create_connection(
                 BACKEND_WS_URL, sslopt={"cert_reqs": ssl.CERT_NONE}, timeout=5,
                 enable_multithread=True)
+            # IMPORTANT: create_connection's timeout also becomes the socket's recv
+            # timeout. Clear it (blocking) so the reader's recv() blocks indefinitely
+            # instead of dying after 5 s of idle — otherwise it stops answering the
+            # server's keepalive PINGs and we get dropped (~40 s later).
+            self._ws.settimeout(None)
             # Reader thread: we only PUSH frames, but the server sends keepalive
             # PINGs. websocket-client auto-replies PONG while blocked in recv(), so
-            # draining the socket here is what keeps the connection alive (without it
-            # the server drops us with "keepalive ping timeout").
+            # draining the socket here is what keeps the connection alive.
             threading.Thread(target=self._reader, args=(self._ws,),
                              daemon=True).start()
             print(f"[camera] connected to {BACKEND_WS_URL}", flush=True)

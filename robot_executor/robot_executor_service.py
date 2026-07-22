@@ -76,6 +76,32 @@ MAX_STEP_S = float(os.environ.get("MAX_STEP_S", "10.0"))
 
 
 # --------------------------------------------------------------------------- #
+# rclpy lifecycle — the context is init-once per process (rclpy forbids re-init).
+# Transports create/destroy NODES freely (self-heal), but NEVER re-init or shut
+# down the global context mid-run; shutdown happens once at process exit.
+# --------------------------------------------------------------------------- #
+_RCLPY_LOCK = threading.Lock()
+_rclpy_initialized = False
+_node_seq = 0
+
+
+def _ensure_rclpy_initialized():
+    import rclpy
+    global _rclpy_initialized
+    with _RCLPY_LOCK:
+        if not _rclpy_initialized:
+            rclpy.init()
+            _rclpy_initialized = True
+
+
+def _next_node_name():
+    global _node_seq
+    with _RCLPY_LOCK:
+        _node_seq += 1
+        return f"aivl_robot_executor_go2_{_node_seq}"
+
+
+# --------------------------------------------------------------------------- #
 # Transport interface
 # --------------------------------------------------------------------------- #
 class RobotTransport(ABC):
@@ -107,11 +133,11 @@ class Go2Ros2Transport(RobotTransport):
     def _init_ros(self):
         import rclpy
         from unitree_api.msg import Request
-        if not rclpy.ok():
-            rclpy.init()
-        self._rclpy = rclpy
+        _ensure_rclpy_initialized()   # init-once; safe to call on every rebuild
         self._Request = Request
-        self._node = rclpy.create_node("aivl_robot_executor_go2")
+        # Fresh node name each build so a rebuild never clashes with a not-yet-freed
+        # old node of the same name.
+        self._node = rclpy.create_node(_next_node_name())
         self._pub = self._node.create_publisher(Request, "/api/sport/request", 10)
 
     def _publish(self, api_id: int, parameter: dict | None):
@@ -201,10 +227,11 @@ class Go2Ros2Transport(RobotTransport):
             pass
         if self._dry_run:
             return
+        # Stop motion + destroy THIS node. Do NOT touch the global rclpy context
+        # (init-once, process-wide) — that's shut down once at process exit.
         for step in (
             lambda: self._publish(go2_commands.STOPMOVE_API_ID, None),
             lambda: self._node.destroy_node() if self._node is not None else None,
-            lambda: self._rclpy.shutdown() if self._rclpy.ok() else None,
         ):
             try:
                 step()
@@ -324,6 +351,11 @@ def main():
         for transport in _TRANSPORTS.values():
             transport.shutdown()
         server.server_close()
+        # Shut down the global rclpy context exactly once, on exit.
+        if _rclpy_initialized:
+            import rclpy
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":
