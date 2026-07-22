@@ -192,16 +192,24 @@ class Go2Ros2Transport(RobotTransport):
                 "api_id": intent["api_id"], "parameter": intent["parameter"]}
 
     def shutdown(self):
+        """Tear down defensively — each step independently — so a broken context can
+        always be reset (used both on exit and to evict a failed transport for rebuild)."""
         try:
             with self._move_lock:
                 self._stop_move_loop()
-            if not self._dry_run and self._node is not None:
-                self._publish(go2_commands.STOPMOVE_API_ID, None)
-                self._node.destroy_node()
-                if self._rclpy.ok():
-                    self._rclpy.shutdown()
         except Exception:
             pass
+        if self._dry_run:
+            return
+        for step in (
+            lambda: self._publish(go2_commands.STOPMOVE_API_ID, None),
+            lambda: self._node.destroy_node() if self._node is not None else None,
+            lambda: self._rclpy.shutdown() if self._rclpy.ok() else None,
+        ):
+            try:
+                step()
+            except Exception:
+                pass
 
 
 class UnsupportedRobotTransport(RobotTransport):
@@ -288,8 +296,16 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         try:
             result = _get_transport(robot).execute(skill, params)
         except Exception as e:  # never let a transport error kill the server
+            # Self-heal: drop the broken transport (e.g. a dead ROS2 context after a
+            # network blip) so the NEXT command rebuilds it fresh instead of staying
+            # stuck on 502 until a manual restart.
+            with _TRANSPORTS_LOCK:
+                broken = _TRANSPORTS.pop(robot, None)
+            if broken is not None:
+                broken.shutdown()
             self._send(502, {"ok": False, "robot": robot, "skill": skill,
-                             "error": f"transport error: {e}"})
+                             "error": f"transport error: {e} "
+                             "(dropped; will rebuild on next command)"})
             return
 
         code = 200 if result.get("ok") else 422

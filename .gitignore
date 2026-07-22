@@ -3,4 +3,5 @@
 **/__pycache__/
 **/log/
 **/install/
-.cacherobot_executor/.env
+.cache/
+**/.env
