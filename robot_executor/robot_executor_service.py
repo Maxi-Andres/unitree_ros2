@@ -76,9 +76,11 @@ MAX_STEP_S = float(os.environ.get("MAX_STEP_S", "10.0"))
 
 
 # --------------------------------------------------------------------------- #
-# rclpy lifecycle — the context is init-once per process (rclpy forbids re-init).
-# Transports create/destroy NODES freely (self-heal), but NEVER re-init or shut
-# down the global context mid-run; shutdown happens once at process exit.
+# rclpy lifecycle — bring the global context up on demand and KEEP it recoverable.
+# Transports create/destroy NODES freely (self-heal). The context must never be
+# re-init'd while it is already up (rclpy forbids that), but if a fault took it
+# down (e.g. a DDS/network drop), the NEXT rebuild has to be able to bring it back
+# — so we gate on the ACTUAL context state, not a write-once boolean.
 # --------------------------------------------------------------------------- #
 _RCLPY_LOCK = threading.Lock()
 _rclpy_initialized = False
@@ -86,12 +88,19 @@ _node_seq = 0
 
 
 def _ensure_rclpy_initialized():
+    """(Re)initialize the default rclpy context whenever it isn't currently up.
+
+    Gating on `rclpy.ok()` (the real context state) rather than a boolean that is
+    only ever set to True means a transport rebuilt after a fault can revive rclpy,
+    instead of being stuck forever on 'rclpy.init() has not been called'. Calling
+    `rclpy.init()` again after a shutdown is allowed; calling it twice WITHOUT a
+    shutdown in between is what's forbidden — and `rclpy.ok()` is exactly that gate."""
     import rclpy
     global _rclpy_initialized
     with _RCLPY_LOCK:
-        if not _rclpy_initialized:
+        if not rclpy.ok():
             rclpy.init()
-            _rclpy_initialized = True
+        _rclpy_initialized = True
 
 
 def _next_node_name():
@@ -124,6 +133,9 @@ class Go2Ros2Transport(RobotTransport):
         self._move_lock = threading.Lock()
         self._move_stop = threading.Event()
         self._move_thread = None
+        # Guards the node/publisher handles so the HTTP request thread and the move
+        # loop thread can't rebuild/publish on them concurrently.
+        self._node_lock = threading.Lock()
         self._node = None
         self._pub = None
         self._Request = None
@@ -131,17 +143,37 @@ class Go2Ros2Transport(RobotTransport):
             self._init_ros()
 
     def _init_ros(self):
-        import rclpy
         from unitree_api.msg import Request
-        _ensure_rclpy_initialized()   # init-once; safe to call on every rebuild
         self._Request = Request
+        with self._node_lock:
+            self._build_node_locked()
+
+    def _build_node_locked(self):
+        """(Re)create the ROS2 node + publisher on a live rclpy context. Caller holds
+        `_node_lock`. Safe to call any number of times: it brings rclpy back up if a
+        fault took it down and destroys a stale node first, so the executor recovers
+        on its own instead of getting stuck on 'rclpy.init() has not been called'."""
+        import rclpy
+        _ensure_rclpy_initialized()   # re-inits the context if a fault brought it down
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            self._node = None
+            self._pub = None
         # Fresh node name each build so a rebuild never clashes with a not-yet-freed
         # old node of the same name.
         self._node = rclpy.create_node(_next_node_name())
-        self._pub = self._node.create_publisher(Request, "/api/sport/request", 10)
+        self._pub = self._node.create_publisher(self._Request, "/api/sport/request", 10)
 
     def _publish(self, api_id: int, parameter: dict | None):
-        """Build + publish one sport Request (or just log it in dry-run)."""
+        """Build + publish one sport Request (or just log it in dry-run).
+
+        Self-healing: if the node/context was torn down by a DDS/network blip (the
+        classic '40s' drop), the first publish throws — we rebuild the node once and
+        retry, so a transient fault costs a single message instead of wedging the
+        executor into an endless 502 loop."""
         param_str = json.dumps(parameter) if parameter is not None else ""
         if self._dry_run:
             print(f"[DRY_RUN] would publish /api/sport/request "
@@ -150,7 +182,17 @@ class Go2Ros2Transport(RobotTransport):
         req = self._Request()
         req.header.identity.api_id = api_id
         req.parameter = param_str
-        self._pub.publish(req)
+        import rclpy
+        with self._node_lock:
+            if self._node is None or not rclpy.ok():
+                self._build_node_locked()
+            try:
+                self._pub.publish(req)
+            except Exception as e:
+                print(f"[executor] publish failed ({e}); rebuilding node and retrying",
+                      flush=True)
+                self._build_node_locked()
+                self._pub.publish(req)
 
     def _stop_move_loop(self):
         """Signal any running move loop to end and join it."""
@@ -227,16 +269,21 @@ class Go2Ros2Transport(RobotTransport):
             pass
         if self._dry_run:
             return
-        # Stop motion + destroy THIS node. Do NOT touch the global rclpy context
-        # (init-once, process-wide) — that's shut down once at process exit.
-        for step in (
-            lambda: self._publish(go2_commands.STOPMOVE_API_ID, None),
-            lambda: self._node.destroy_node() if self._node is not None else None,
-        ):
+        # Best-effort stop, then destroy THIS node under the node lock. Do NOT touch
+        # the global rclpy context here (process-wide) — that's shut down once at exit.
+        try:
+            self._publish(go2_commands.STOPMOVE_API_ID, None)
+        except Exception:
+            pass
+        with self._node_lock:
             try:
-                step()
+                if self._node is not None:
+                    self._node.destroy_node()
             except Exception:
                 pass
+            finally:
+                self._node = None
+                self._pub = None
 
 
 class UnsupportedRobotTransport(RobotTransport):
@@ -285,9 +332,17 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") == "/health":
+            # rclpy is brought up lazily on the first /execute, so `rclpy_ok` is
+            # False until then — informational, never a reason to fail /health.
+            try:
+                import rclpy
+                rclpy_ok = bool(rclpy.ok())
+            except Exception:
+                rclpy_ok = False
             self._send(200, {"ok": True, "service": "robot_executor",
                              "default_robot": DEFAULT_ROBOT, "safe_mode": SAFE_MODE,
-                             "dry_run": DRY_RUN, "robot_ip": ROBOT_IP})
+                             "dry_run": DRY_RUN, "robot_ip": ROBOT_IP,
+                             "rclpy_ok": rclpy_ok})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
