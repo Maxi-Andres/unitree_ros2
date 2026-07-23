@@ -19,8 +19,21 @@ GO2_SPEED_PRESETS = {
 }
 DEFAULT_SPEED = "slow"
 
+# Safety clamps for direct velocity control (the `move` skill from the drive pad).
+MAX_VX = 1.2    # m/s forward/back
+MAX_VY = 0.8    # m/s strafe left/right
+MAX_VYAW = 2.0  # rad/s yaw
+
 MOVE_API_ID = 1008
 STOPMOVE_API_ID = 1003
+
+
+def _clamp(value, limit):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-limit, min(limit, v))
 
 # Skills that are a single no-parameter sport command.
 GO2_SIMPLE_API = {
@@ -95,6 +108,17 @@ def resolve(skill, params):
       {"kind": "unsupported", "reason": str}
     """
     params = params or {}
+
+    # Direct velocity control (the drive-pad joysticks / WASD): raw vx/vy/vyaw,
+    # continuous by default, clamped to the safety limits above.
+    if skill == "move":
+        duration = params.get("duration_s")
+        return {"kind": "move",
+                "vx": _clamp(params.get("vx"), MAX_VX),
+                "vy": _clamp(params.get("vy"), MAX_VY),
+                "vyaw": _clamp(params.get("vyaw"), MAX_VYAW),
+                "duration": duration if isinstance(duration, (int, float)) else None,
+                "continuous": bool(params.get("continuous", True))}
 
     if skill in ("walk", "turn"):
         vx, vy, vyaw = _velocity_for(skill, params)

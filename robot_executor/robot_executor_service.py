@@ -203,21 +203,28 @@ class Go2Ros2Transport(RobotTransport):
         self._move_thread = None
 
     def _run_move_loop(self, vx, vy, vyaw, deadline):
-        """Re-publish Move at MOVE_RATE_HZ until stopped or the deadline passes, then
-        (for a bounded move) StopMove. A held velocity needs re-sending; this also
-        means a crash/stop reliably halts the robot."""
+        """Re-publish Move at MOVE_RATE_HZ until stopped or the deadline passes. A
+        held velocity needs re-sending; a bounded move also acts as a DEADMAN: if it
+        reaches its deadline (no fresh command arrived) it halts the robot on its own.
+
+        StopMove is published ONLY when the deadline is actually reached — NOT when
+        the loop is superseded by a newer move. That lets a teleop pad refresh a
+        short bounded move every tick for smooth continuous motion (each refresh
+        cancels the previous loop without injecting a stop), while a frozen/crashed
+        client still stops the robot within one `deadline`. An explicit 'stop' skill
+        halts it immediately (it calls StopMove itself)."""
         period = 1.0 / MOVE_RATE_HZ
+        reached_deadline = False
         try:
             while not self._move_stop.is_set():
                 if deadline is not None and time.monotonic() >= deadline:
+                    reached_deadline = True
                     break
                 self._publish(go2_commands.MOVE_API_ID,
                               {"x": vx, "y": vy, "z": vyaw})
                 time.sleep(period)
         finally:
-            # Always stop when a bounded move ends; a continuous move is halted by the
-            # explicit 'stop' skill (which also calls StopMove).
-            if deadline is not None:
+            if reached_deadline:
                 self._publish(go2_commands.STOPMOVE_API_ID, None)
 
     def _start_move(self, vx, vy, vyaw, duration, continuous):
