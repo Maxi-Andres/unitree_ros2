@@ -295,12 +295,25 @@ def build_source(robot, node, on_frame, cfg, logger=None):
             resolution=cfg.get("GO2_RESOLUTION", "native"),
             quality=0, logger=logger)
     if robot == "g1":
-        return G1ImageTopicSource(
+        # This G1 firmware exposes the Unitree videohub (ready JPEGs, efficient) just
+        # like the Go2, and its RealSense raw topic (/camera/color/image_raw) is
+        # often idle (0 Hz) -> a "frozen" frame. Default to the videohub; opt into
+        # the ROS2 image topic with G1_CAMERA_SOURCE=topic (or by setting
+        # G1_IMAGE_TOPIC), e.g. once the RealSense node is actually streaming.
+        use_topic = (cfg.get("G1_CAMERA_SOURCE", "").lower() == "topic"
+                     or bool(cfg.get("G1_IMAGE_TOPIC")))
+        if use_topic:
+            return G1ImageTopicSource(
+                node, on_frame,
+                topic=cfg.get("G1_IMAGE_TOPIC", ""),  # "" => auto-discover
+                fps=float(cfg.get("G1_VIDEO_FPS", 12)),
+                resolution=cfg.get("G1_RESOLUTION", "native"),
+                quality=int(cfg.get("JPEG_QUALITY", 70) or 70), logger=logger)
+        return Go2VideoApiSource(
             node, on_frame,
-            topic=cfg.get("G1_IMAGE_TOPIC", ""),  # "" => auto-discover
             fps=float(cfg.get("G1_VIDEO_FPS", 12)),
             resolution=cfg.get("G1_RESOLUTION", "native"),
-            quality=int(cfg.get("JPEG_QUALITY", 70) or 70), logger=logger)
+            quality=0, logger=logger)
     if robot == "test":
         return TestPatternSource(
             node, on_frame, fps=float(cfg.get("TEST_FPS", 15)),

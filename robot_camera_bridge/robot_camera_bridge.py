@@ -60,7 +60,7 @@ START_STREAMING = _as_bool(os.environ.get("START_STREAMING"), False)
 # Passed through to the camera source (fps, resolution, quality, topic…).
 SOURCE_CFG = {k: os.environ[k] for k in (
     "GO2_VIDEO_FPS", "GO2_RESOLUTION", "JPEG_QUALITY",
-    "G1_IMAGE_TOPIC", "G1_VIDEO_FPS", "G1_RESOLUTION",
+    "G1_CAMERA_SOURCE", "G1_IMAGE_TOPIC", "G1_VIDEO_FPS", "G1_RESOLUTION",
     "TEST_FPS") if k in os.environ}
 
 

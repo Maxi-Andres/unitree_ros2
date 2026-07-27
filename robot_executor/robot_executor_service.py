@@ -34,6 +34,7 @@ from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import go2_commands
+import g1_commands
 
 
 # --------------------------------------------------------------------------- #
@@ -103,11 +104,11 @@ def _ensure_rclpy_initialized():
         _rclpy_initialized = True
 
 
-def _next_node_name():
+def _next_node_name(tag="robot"):
     global _node_seq
     with _RCLPY_LOCK:
         _node_seq += 1
-        return f"aivl_robot_executor_go2_{_node_seq}"
+        return f"aivl_robot_executor_{tag}_{_node_seq}"
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +294,176 @@ class Go2Ros2Transport(RobotTransport):
                 self._pub = None
 
 
+class G1Ros2Transport(RobotTransport):
+    """Drives the Unitree G1 (humanoid) over ROS2. Unlike the Go2 (one sport topic),
+    the G1 spans THREE request topics — locomotion + FSM + loco gestures on
+    /api/sport/request, preset arm actions on /api/arm/request, and TTS/audio on
+    /api/voice/request — all as unitree_api/msg/Request. Mirrors the Go2 transport's
+    node lifecycle, self-heal, and bounded-move deadman loop."""
+
+    _PUB_DUR = 1.0  # per-tick SetVelocity duration (s); re-published each move tick
+
+    def __init__(self, dry_run: bool):
+        self._dry_run = dry_run
+        self._move_lock = threading.Lock()
+        self._move_stop = threading.Event()
+        self._move_thread = None
+        self._node_lock = threading.Lock()
+        self._node = None
+        self._pubs = {}          # name -> publisher (sport/arm/voice)
+        self._Request = None
+        self._tts_index = 0
+        if not dry_run:
+            self._init_ros()
+
+    def _init_ros(self):
+        from unitree_api.msg import Request
+        self._Request = Request
+        with self._node_lock:
+            self._build_node_locked()
+
+    def _build_node_locked(self):
+        """(Re)create the node + one publisher per G1 request topic on a live rclpy
+        context. Self-healing, same contract as the Go2 transport."""
+        import rclpy
+        _ensure_rclpy_initialized()
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            self._node = None
+            self._pubs = {}
+        self._node = rclpy.create_node(_next_node_name("g1"))
+        self._pubs = {
+            name: self._node.create_publisher(self._Request, topic, 10)
+            for name, topic in g1_commands.TOPICS.items()
+        }
+
+    def _next_tts_index(self):
+        self._tts_index += 1
+        return self._tts_index
+
+    def _publish(self, pub_name: str, api_id: int, parameter: dict | None):
+        """Publish one Request on the named topic (self-healing + one retry)."""
+        param_str = json.dumps(parameter) if parameter is not None else ""
+        if self._dry_run:
+            print(f"[DRY_RUN] would publish {g1_commands.TOPICS.get(pub_name, pub_name)} "
+                  f"api_id={api_id} parameter={param_str!r}", flush=True)
+            return
+        req = self._Request()
+        req.header.identity.api_id = api_id
+        req.parameter = param_str
+        import rclpy
+        with self._node_lock:
+            if self._node is None or not rclpy.ok():
+                self._build_node_locked()
+            try:
+                self._pubs[pub_name].publish(req)
+            except Exception as e:
+                print(f"[executor] G1 publish failed ({e}); rebuilding node and retrying",
+                      flush=True)
+                self._build_node_locked()
+                self._pubs[pub_name].publish(req)
+
+    def _set_velocity(self, vx, vy, vyaw, duration):
+        self._publish(g1_commands.SPORT, g1_commands.SET_VELOCITY_API_ID,
+                      {"velocity": [vx, vy, vyaw], "duration": duration})
+
+    def _stop_move_loop(self):
+        self._move_stop.set()
+        thread = self._move_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._move_thread = None
+
+    def _run_move_loop(self, vx, vy, vyaw, deadline):
+        """Re-publish SetVelocity at MOVE_RATE_HZ until stopped or the deadline
+        passes. Each publish carries its own short duration, so a frozen client stops
+        the robot on its own; StopMove is sent only when the deadline is reached (not
+        when a fresh command supersedes this loop) — smooth continuous walking."""
+        period = 1.0 / MOVE_RATE_HZ
+        reached_deadline = False
+        try:
+            while not self._move_stop.is_set():
+                if deadline is not None and time.monotonic() >= deadline:
+                    reached_deadline = True
+                    break
+                self._set_velocity(vx, vy, vyaw, self._PUB_DUR)
+                time.sleep(period)
+        finally:
+            if reached_deadline:
+                self._set_velocity(0.0, 0.0, 0.0, 1.0)
+
+    def _start_move(self, vx, vy, vyaw, duration, continuous):
+        with self._move_lock:
+            self._stop_move_loop()
+            self._move_stop = threading.Event()
+            deadline = None
+            if not continuous:
+                step = duration if duration else DEFAULT_STEP_S
+                step = max(0.1, min(step, MAX_STEP_S))
+                deadline = time.monotonic() + step
+            self._move_thread = threading.Thread(
+                target=self._run_move_loop, args=(vx, vy, vyaw, deadline), daemon=True)
+            self._move_thread.start()
+
+    def execute(self, skill: str, params: dict) -> dict:
+        intent = g1_commands.resolve(skill, params or {})
+        kind = intent["kind"]
+
+        if kind == "unsupported":
+            return {"ok": False, "detail": intent["reason"]}
+
+        if kind == "stop":
+            with self._move_lock:
+                self._stop_move_loop()
+            self._set_velocity(0.0, 0.0, 0.0, 1.0)
+            return {"ok": True, "detail": "StopMove (SetVelocity 0)",
+                    "api_id": g1_commands.SET_VELOCITY_API_ID}
+
+        if kind == "move":
+            self._start_move(intent["vx"], intent["vy"], intent["vyaw"],
+                             intent["duration"], intent["continuous"])
+            mode = "continuous (until 'stop')" if intent["continuous"] else \
+                f"{intent['duration'] or DEFAULT_STEP_S:.1f}s step"
+            return {"ok": True, "api_id": g1_commands.SET_VELOCITY_API_ID,
+                    "detail": f"Move v=[{intent['vx']},{intent['vy']},{intent['vyaw']}] ({mode})"}
+
+        if kind == "say":
+            idx = self._next_tts_index()
+            self._publish(g1_commands.VOICE, g1_commands.AUDIO_TTS_API_ID,
+                          {"index": idx, "text": intent["text"], "speaker_id": 0})
+            return {"ok": True, "detail": f"TTS: {intent['text'][:60]}"}
+
+        # single (FSM posture, stand height, loco gesture, arm action, set volume)
+        self._publish(intent["pub"], intent["api_id"], intent["parameter"])
+        return {"ok": True, "detail": f"{intent['pub']} api_id={intent['api_id']}",
+                "api_id": intent["api_id"], "parameter": intent["parameter"]}
+
+    def shutdown(self):
+        try:
+            with self._move_lock:
+                self._stop_move_loop()
+        except Exception:
+            pass
+        if self._dry_run:
+            return
+        try:
+            self._set_velocity(0.0, 0.0, 0.0, 1.0)
+        except Exception:
+            pass
+        with self._node_lock:
+            try:
+                if self._node is not None:
+                    self._node.destroy_node()
+            except Exception:
+                pass
+            finally:
+                self._node = None
+                self._pubs = {}
+
+
 class UnsupportedRobotTransport(RobotTransport):
     """Placeholder for a robot with no transport yet (e.g. G1 over ROS2/SDK)."""
 
@@ -310,12 +481,23 @@ class UnsupportedRobotTransport(RobotTransport):
 _TRANSPORTS: dict[str, RobotTransport] = {}
 _TRANSPORTS_LOCK = threading.Lock()
 
+# Per-robot command module (skill -> intent mapping). Also the source of each
+# robot's SAFE_MODE-blocked skill set.
+_CMD_MODULES = {"go2": go2_commands, "g1": g1_commands}
+
+
+def _dangerous_skills(robot: str) -> set:
+    mod = _CMD_MODULES.get(robot)
+    return getattr(mod, "DANGEROUS_SKILLS", set()) if mod else set()
+
 
 def _get_transport(robot: str) -> RobotTransport:
     with _TRANSPORTS_LOCK:
         if robot not in _TRANSPORTS:
             if robot == "go2":
                 _TRANSPORTS[robot] = Go2Ros2Transport(dry_run=DRY_RUN)
+            elif robot == "g1":
+                _TRANSPORTS[robot] = G1Ros2Transport(dry_run=DRY_RUN)
             else:
                 _TRANSPORTS[robot] = UnsupportedRobotTransport(robot)
         return _TRANSPORTS[robot]
@@ -375,7 +557,7 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         # Per-request safe_mode (page toggle) overrides the env default when present.
         req_safe = body.get("safe_mode")
         effective_safe = req_safe if isinstance(req_safe, bool) else SAFE_MODE
-        if effective_safe and skill in go2_commands.DANGEROUS_SKILLS:
+        if effective_safe and skill in _dangerous_skills(robot):
             self._send(403, {"ok": False, "blocked": True, "robot": robot,
                              "skill": skill,
                              "error": f"'{skill}' blocked by SAFE_MODE (acrobatic). "
