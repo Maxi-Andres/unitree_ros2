@@ -75,10 +75,16 @@ GO2_GAIT_API = {
     "cross_step": (2051, True),
 }
 
-# Acrobatics that lift the body / risk a fall — blocked while SAFE_MODE is on.
+# Blocked while SAFE_MODE is on. Criterion: anything that can make the robot lose its
+# support (fall / go limp) or that leaves its own footprint and needs clear space.
+# Controlled postures (stand_down, sit, rise_sit, recovery_stand) stay allowed.
+# Mirrors command_common.GO2_DANGEROUS in AI-VL-core (the UI reads that one).
 DANGEROUS_SKILLS = {
-    "front_flip", "back_flip", "left_flip", "front_jump", "front_pounce",
-    "handstand", "walk_upright",
+    "front_flip", "back_flip", "left_flip",  # airborne acrobatics
+    "front_jump", "front_pounce",
+    "handstand", "walk_upright",             # balances on two legs -> tips over easily
+    "damp",                                  # limp -> drops to the floor
+    "dance1", "dance2",                      # whole-body routines, needs clear space
 }
 
 
