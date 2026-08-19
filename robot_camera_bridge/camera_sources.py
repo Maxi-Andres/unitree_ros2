@@ -18,7 +18,9 @@ Sources:
 All sources share fps/resolution/quality params (set at build, live-tunable via the
 bridge's /config), and a close() so the bridge can switch source robot at runtime.
 """
+import threading
 import time
+import urllib.request
 
 import cv2
 import numpy as np
@@ -255,6 +257,85 @@ class G1ImageTopicSource(_ParamSource):
         self._sub = self._disc_timer = None
 
 
+class HttpStreamSource(_ParamSource):
+    """Read an MJPEG stream over HTTP instead of the robot's DDS.
+
+    THE POINT: this source needs no ROS entities and no DDS at all, so the bridge keeps
+    working when the robot is NOT on this machine's subnet — which is the normal case once
+    the robot is itinerant (field, Starlink, LTE). DDS cannot cross a subnet boundary on
+    these robots: measured 122 topics from the robot's own subnet, 2 from another one, 3
+    even with explicit unicast peers. See SplunkCode/RED-Y-DDS.md.
+
+    The video already leaves the robot as H.264 (encoded in hardware on its Jetson, pushed
+    over RTMP to mediamtx) and Frigate re-serves it as multipart/x-mixed-replace MJPEG. The
+    frames arriving here are therefore ALREADY JPEG, so with the default quality=0 they are
+    forwarded untouched — no decode, no re-encode, cheaper than the DDS path.
+
+    Runs its own reader thread: an HTTP body read blocks, which must never happen on the ROS
+    executor thread.
+    """
+
+    def __init__(self, node, on_frame, url, fps=15, resolution="native", quality=0,
+                 logger=None):
+        super().__init__(fps, resolution, quality)
+        self._on_frame = on_frame
+        self._url = url
+        self._log = logger
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="http-stream",
+                                        daemon=True)
+        self._thread.start()
+        if logger:
+            logger.info(f"[camera] HTTP stream source: {url}")
+
+    def _run(self):
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                self._read_stream()
+                backoff = 1.0
+            except Exception as exc:
+                if self._log and not self._stop.is_set():
+                    self._log.warn(f"[camera] stream {self._url} failed: {exc}; "
+                                   f"retry in {backoff:.0f}s")
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, 15.0)
+
+    def _read_stream(self):
+        # Scan for JPEG SOI/EOI markers rather than parsing multipart boundaries: it is
+        # boundary-name agnostic, so the same code handles Frigate, mediamtx and any
+        # generic MJPEG endpoint.
+        req = urllib.request.Request(self._url, headers={"User-Agent": "ai-vl-bridge"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            buf = b""
+            while not self._stop.is_set():
+                chunk = resp.read(8192)
+                if not chunk:
+                    raise IOError("stream closed by peer")
+                buf += chunk
+                while True:
+                    start = buf.find(b"\xff\xd8")
+                    if start < 0:
+                        # Keep the tail: a marker can straddle two chunks.
+                        buf = buf[-1:]
+                        break
+                    end = buf.find(b"\xff\xd9", start + 2)
+                    if end < 0:
+                        if start > 0:
+                            buf = buf[start:]
+                        break
+                    frame = buf[start:end + 2]
+                    buf = buf[end + 2:]
+                    if self._due():
+                        jpg = _reprocess(jpeg=frame, resolution=self._res,
+                                         quality=self._quality)
+                        if jpg:
+                            self._on_frame(jpg)
+
+    def close(self):
+        self._stop.set()
+
+
 class TestPatternSource(_ParamSource):
     """Synthetic moving frame (no robot) — verifies the pipeline end to end."""
 
@@ -314,8 +395,16 @@ def build_source(robot, node, on_frame, cfg, logger=None):
             fps=float(cfg.get("G1_VIDEO_FPS", 12)),
             resolution=cfg.get("G1_RESOLUTION", "native"),
             quality=0, logger=logger)
+    if robot == "stream":
+        # No robot subnet required: reads the video that already left the robot.
+        return HttpStreamSource(
+            node, on_frame,
+            url=cfg.get("STREAM_URL", "http://127.0.0.1:5000/api/robot"),
+            fps=float(cfg.get("STREAM_FPS", 15)),
+            resolution=cfg.get("STREAM_RESOLUTION", "native"),
+            quality=int(cfg.get("STREAM_QUALITY", 0) or 0), logger=logger)
     if robot == "test":
         return TestPatternSource(
             node, on_frame, fps=float(cfg.get("TEST_FPS", 15)),
             quality=int(cfg.get("JPEG_QUALITY", 70) or 70), logger=logger)
-    raise ValueError(f"unknown robot camera source '{robot}' (go2|g1|test)")
+    raise ValueError(f"unknown robot camera source '{robot}' (go2|g1|stream|test)")

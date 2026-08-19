@@ -52,7 +52,9 @@ def _as_bool(v, default):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _load_dotenv(os.path.join(_HERE, ".env"))
 
-ROBOT = os.environ.get("CAMERA_ROBOT", "go2")           # go2 | g1 | test
+ROBOT = os.environ.get("CAMERA_ROBOT", "go2")           # go2 | g1 | stream | test
+# "stream" needs no DDS: it reads the video that already left the robot (see
+# camera_sources.HttpStreamSource). Use it whenever the robot is not on this subnet.
 BACKEND_WS_URL = os.environ.get("BACKEND_WS_URL", "wss://localhost:8443/ws/robot-cam")
 CONTROL_HOST = os.environ.get("CAMERA_CONTROL_HOST", "0.0.0.0")
 CONTROL_PORT = int(os.environ.get("CAMERA_CONTROL_PORT", "8091"))
@@ -100,7 +102,7 @@ class SourceManager:
             self._node.get_logger().error(f"camera switch to '{pending}' failed: {e}")
 
     def request_robot(self, robot):
-        if robot not in ("go2", "g1", "test"):
+        if robot not in ("go2", "g1", "stream", "test"):
             return False
         with self._lock:
             self._pending = robot
