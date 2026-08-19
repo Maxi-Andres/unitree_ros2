@@ -214,6 +214,13 @@ def _set_env_keys(updates: dict) -> None:
         f.write("\n".join(out).rstrip("\n") + "\n")
     os.replace(tmp, ENV_PATH)
 
+    # Overwrite the live environment too, or the change silently never applies: .env is
+    # loaded with setdefault(), so an existing value wins, and _restart_self() re-execs and
+    # INHERITS this process's environment. Without this the file would say one thing and the
+    # running service would keep using the old value forever.
+    for key, value in updates.items():
+        os.environ[key] = str(value)
+
 
 def _relay_health(url: str) -> dict:
     """Ask the on-robot relay what IT reports about itself.
