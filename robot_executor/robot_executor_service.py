@@ -186,6 +186,64 @@ def _write_dds_env(iface: str, peers: list) -> None:
     os.replace(tmp, DDS_ENV_PATH)  # atomic: never leave a half-written config
 
 
+ENV_PATH = os.path.join(_HERE, ".env")
+
+
+def _set_env_keys(updates: dict) -> None:
+    """Persist KEY=VALUE pairs into robot_executor/.env, replacing existing keys.
+
+    Written atomically for the same reason as dds.env: a half-written config would leave
+    the executor unable to start, and it is restarted immediately after this.
+    """
+    lines = []
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={value}")
+    tmp = ENV_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+    os.replace(tmp, ENV_PATH)
+
+
+def _relay_health(url: str) -> dict:
+    """Ask the on-robot relay what IT reports about itself.
+
+    Includes where the robot is publishing its video to, read by the relay from the running
+    process. That value belongs to the robot, so the UI shows what the robot says instead of
+    a hardcoded address that silently goes stale."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=2) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _transport_config() -> dict:
+    """How each robot is reached today: DDS from this machine, or a relay on the robot."""
+    out = {}
+    for robot in ("go2", "g1"):
+        prefix = robot.upper()
+        mode = os.environ.get(f"{prefix}_TRANSPORT", "dds").strip().lower()
+        url = os.environ.get(f"{prefix}_RELAY_URL", "").strip()
+        entry = {"mode": mode, "url": url}
+        # Only when a relay is actually in use: no point probing an unconfigured robot, and
+        # the 2 s timeout must not be paid for nothing.
+        if mode in ("relay", "auto") and url:
+            entry["relay"] = _relay_health(url)
+        out[robot] = entry
+    return out
+
+
 def _restart_self():
     """Re-exec through run_executor.sh so setup.sh rebuilds CYCLONEDDS_URI from the
     file we just wrote. CycloneDDS reads that config once per process, so a restart is
@@ -1038,8 +1096,63 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         # Restart on another thread so this handler can finish and close the socket.
         threading.Thread(target=_restart_self, daemon=True).start()
 
+    def _handle_transport(self, body):
+        """POST /transport {robot, mode: dds|relay|auto, url?} — persist how commands
+        reach the robot and restart to apply it.
+
+        WHY THIS EXISTS: publishing DDS from this machine only works while the robot shares
+        its subnet (measured: 122 topics from the robot's own subnet, 2 from another one).
+        "relay" sends the command over HTTP to an agent running ON the robot, which is what
+        works once the robot is itinerant. Switchable at runtime because which one is
+        correct depends on where the robot is right now."""
+        robot = str(body.get("robot") or DEFAULT_ROBOT).strip().lower()
+        if robot not in ("go2", "g1"):
+            self._send(400, {"ok": False, "error": f"unknown robot '{robot}'"})
+            return
+        mode = str(body.get("mode") or "").strip().lower()
+        if mode not in ("dds", "relay", "auto"):
+            self._send(400, {"ok": False,
+                             "error": "'mode' must be dds, relay or auto"})
+            return
+
+        prefix = robot.upper()
+        updates = {f"{prefix}_TRANSPORT": mode}
+        url = str(body.get("url") or "").strip()
+        if url:
+            if not url.startswith(("http://", "https://")):
+                self._send(400, {"ok": False,
+                                 "error": "'url' must start with http:// or https://"})
+                return
+            updates[f"{prefix}_RELAY_URL"] = url
+        elif mode == "relay" and not os.environ.get(f"{prefix}_RELAY_URL", "").strip():
+            self._send(400, {"ok": False,
+                             "error": f"mode 'relay' needs a url ({prefix}_RELAY_URL is "
+                                      f"unset)"})
+            return
+
+        try:
+            _set_env_keys(updates)
+        except OSError as e:
+            self._send(500, {"ok": False, "error": f"could not write {ENV_PATH}: {e}"})
+            return
+
+        self._send(200, {"ok": True, "robot": robot, "mode": mode,
+                         "url": updates.get(f"{prefix}_RELAY_URL",
+                                            os.environ.get(f"{prefix}_RELAY_URL", "")),
+                         "restarting": True,
+                         "detail": "transport saved; the executor is restarting to apply "
+                                   "it (a few seconds)."})
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        threading.Thread(target=_restart_self, daemon=True).start()
+
     def do_GET(self):
         path = self.path.rstrip("/")
+        if path == "/transport":
+            self._send(200, {"ok": True, "transports": _transport_config()})
+            return
         if path == "/dds":
             cfg = _read_dds_env()
             peers = [p for p in cfg["ROBOT_DDS_PEERS"].split(",") if p.strip()]
@@ -1088,7 +1201,7 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.rstrip("/")
-        if path not in ("/execute", "/dds"):
+        if path not in ("/execute", "/dds", "/transport"):
             self._send(404, {"ok": False, "error": "not found"})
             return
         try:
@@ -1100,6 +1213,10 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
         if path == "/dds":
             self._handle_dds(body)
+            return
+
+        if path == "/transport":
+            self._handle_transport(body)
             return
 
         robot = (body.get("robot") or DEFAULT_ROBOT).strip()
