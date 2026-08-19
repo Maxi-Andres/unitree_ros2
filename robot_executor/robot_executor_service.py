@@ -46,6 +46,8 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -788,6 +790,132 @@ class G1Ros2Transport(RobotTransport):
                 self._pubs = {}
 
 
+class RelayTransport(RobotTransport):
+    """Command the robot over HTTP instead of publishing DDS from this machine.
+
+    WHY: DDS cannot cross a subnet boundary on these robots — measured, 122 topics from the
+    robot's own subnet, 2 from another one, 3 even with explicit unicast peers (see
+    SplunkCode/RED-Y-DDS.md). Once the robot is itinerant (field, Starlink, LTE) it will
+    never share a subnet with this machine, so the process that publishes commands has to
+    live ON the robot. This transport talks to it over HTTP; the robot-side relay
+    (robot-splunk-bridge/relay/) is what touches DDS.
+
+    Skill resolution is reused from go2_commands, so a skill behaves the same over DDS or
+    over the WAN. What differs is the ALLOWLIST: only the verbs below can be sent remotely.
+    Acrobatics (flips, jumps, dances, handstand) are deliberately absent, and the relay
+    would refuse them anyway — driving a robot you cannot see should not be able to flip it.
+
+    Movement is re-sent while it lasts rather than latched once: the relay runs a dead-man
+    switch and stops the robot if a movement is not refreshed, so a dropped link stops the
+    robot instead of leaving it walking.
+    """
+
+    VERB_FOR_SKILL = {
+        "stop": "stop_move",
+        "stand_up": "stand_up",
+        "stand_down": "stand_down",
+        "balance_stand": "balance_stand",
+        "recovery_stand": "recovery_stand",
+        "sit": "sit",
+        "rise_sit": "rise_sit",
+        "damp": "damp",
+        "hello": "hello",
+    }
+    # Well inside the relay's default 1500 ms dead-man window.
+    _REFRESH_S = 0.4
+
+    def __init__(self, robot: str, url: str, token: str, dry_run: bool):
+        self._robot = robot
+        self._url = url.rstrip("/") + "/cmd"
+        self._token = token
+        self._dry_run = dry_run
+        self._move_lock = threading.Lock()
+        self._move_stop = threading.Event()
+        self._move_thread = None
+        print(f"[executor] {robot}: RELAY transport -> {self._url}", flush=True)
+
+    def _post(self, body: dict) -> dict:
+        if self._dry_run:
+            print(f"[DRY_RUN] would POST {self._url} {body}", flush=True)
+            return {"ok": True, "reply": "ok dry-run"}
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            self._url, data=data,
+            headers={"Authorization": f"Bearer {self._token}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode("utf-8", "replace")
+            return {"ok": False, "reply": f"HTTP {exc.code}: {detail}"}
+        except Exception as exc:
+            return {"ok": False, "reply": f"relay unreachable: {exc}"}
+
+    def _stop_move_loop(self):
+        self._move_stop.set()
+        t = self._move_thread
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+        self._move_thread = None
+
+    def _run_move_loop(self, vx, vy, vyaw, deadline):
+        """Re-send the movement until told to stop, feeding the relay's dead-man switch."""
+        while not self._move_stop.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            self._post({"verb": "move", "vx": vx, "vy": vy, "vyaw": vyaw})
+            self._move_stop.wait(self._REFRESH_S)
+        self._post({"verb": "stop_move"})
+
+    def _start_move(self, vx, vy, vyaw, duration, continuous):
+        with self._move_lock:
+            self._stop_move_loop()
+            self._move_stop = threading.Event()
+            deadline = None if continuous else \
+                time.monotonic() + (duration or DEFAULT_STEP_S)
+            self._move_thread = threading.Thread(
+                target=self._run_move_loop, args=(vx, vy, vyaw, deadline),
+                name=f"relay-move-{self._robot}", daemon=True)
+            self._move_thread.start()
+
+    def execute(self, skill: str, params: dict) -> dict:
+        intent = go2_commands.resolve(skill, params or {})
+        kind = intent["kind"]
+
+        if kind == "unsupported":
+            return {"ok": False, "detail": intent["reason"]}
+
+        if kind == "stop":
+            with self._move_lock:
+                self._stop_move_loop()
+            res = self._post({"verb": "stop_move"})
+            return {"ok": bool(res.get("ok")), "detail": f"StopMove via relay "
+                    f"({res.get('reply')})"}
+
+        if kind == "move":
+            self._start_move(intent["vx"], intent["vy"], intent["vyaw"],
+                             intent["duration"], intent["continuous"])
+            mode = "continuous (until 'stop')" if intent["continuous"] else \
+                f"{intent['duration'] or DEFAULT_STEP_S:.1f}s step"
+            return {"ok": True, "detail": f"Move via relay vx={intent['vx']} "
+                    f"vy={intent['vy']} vyaw={intent['vyaw']} ({mode})"}
+
+        verb = self.VERB_FOR_SKILL.get(skill)
+        if verb is None:
+            return {"ok": False, "detail": f"'{skill}' is not available over the relay "
+                    f"(remote allowlist: {sorted(self.VERB_FOR_SKILL)} + move/stop)"}
+        res = self._post({"verb": verb})
+        return {"ok": bool(res.get("ok")),
+                "detail": f"{verb} via relay ({res.get('reply')})"}
+
+    def shutdown(self, stop_first: bool = True):
+        with self._move_lock:
+            self._stop_move_loop()
+        if stop_first and not self._dry_run:
+            self._post({"verb": "stop_move"})
+
+
 class UnsupportedRobotTransport(RobotTransport):
     """Placeholder for a robot with no transport yet (e.g. G1 over ROS2/SDK)."""
 
@@ -818,7 +946,29 @@ def _dangerous_skills(robot: str) -> set:
 def _get_transport(robot: str) -> RobotTransport:
     with _TRANSPORTS_LOCK:
         if robot not in _TRANSPORTS:
-            if robot == "go2":
+            # Per-robot transport switch. DDS stays the default so nothing changes
+            # unless asked; "relay" is what makes commands work when the robot is NOT on
+            # this machine's subnet, which is the normal case for an itinerant robot.
+            #   GO2_TRANSPORT=relay  GO2_RELAY_URL=http://10.1.254.18:8092
+            mode = os.environ.get(f"{robot.upper()}_TRANSPORT", "dds").strip().lower()
+            relay_url = os.environ.get(f"{robot.upper()}_RELAY_URL", "").strip()
+            if mode == "relay" or (mode == "auto" and relay_url):
+                token = os.environ.get("RELAY_TOKEN", "").strip()
+                if not token:
+                    token_file = os.environ.get(
+                        "RELAY_TOKEN_FILE", os.path.expanduser("~/.relay_token"))
+                    try:
+                        with open(token_file) as fh:
+                            token = fh.read().strip()
+                    except OSError:
+                        token = ""
+                if not relay_url:
+                    _TRANSPORTS[robot] = UnsupportedRobotTransport(
+                        f"{robot} (relay selected but {robot.upper()}_RELAY_URL is unset)")
+                else:
+                    _TRANSPORTS[robot] = RelayTransport(
+                        robot, relay_url, token, dry_run=DRY_RUN)
+            elif robot == "go2":
                 _TRANSPORTS[robot] = Go2Ros2Transport(dry_run=DRY_RUN)
             elif robot == "g1":
                 _TRANSPORTS[robot] = G1Ros2Transport(dry_run=DRY_RUN)
