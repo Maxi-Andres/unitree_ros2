@@ -242,7 +242,11 @@ def _transport_config() -> dict:
         prefix = robot.upper()
         mode = os.environ.get(f"{prefix}_TRANSPORT", "dds").strip().lower()
         url = os.environ.get(f"{prefix}_RELAY_URL", "").strip()
-        entry = {"mode": mode, "url": url}
+        # Address to probe for "is this robot up". Stored here so every viewer agrees, but
+        # PROBED BY THE BACKEND: ping needs raw sockets, which are unavailable in this
+        # container, and the backend runs on the host where they work.
+        entry = {"mode": mode, "url": url,
+                 "ping_ip": os.environ.get(f"{prefix}_PING_IP", "").strip()}
         # Only when a relay is actually in use: no point probing an unconfigured robot, and
         # the 2 s timeout must not be paid for nothing.
         if mode in ("relay", "auto") and url:
@@ -1116,7 +1120,9 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         if robot not in ("go2", "g1"):
             self._send(400, {"ok": False, "error": f"unknown robot '{robot}'"})
             return
-        mode = str(body.get("mode") or "").strip().lower()
+        prefix_now = robot.upper()
+        mode = str(body.get("mode")
+                   or os.environ.get(f"{prefix_now}_TRANSPORT", "dds")).strip().lower()
         if mode not in ("dds", "relay", "auto"):
             self._send(400, {"ok": False,
                              "error": "'mode' must be dds, relay or auto"})
@@ -1124,11 +1130,26 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
         prefix = robot.upper()
         updates = {f"{prefix}_TRANSPORT": mode}
-        url = str(body.get("url") or "").strip()
-        if url:
-            if not url.startswith(("http://", "https://")):
+        if "ping_ip" in body:
+            ping_ip = str(body.get("ping_ip") or "").strip()
+            if ping_ip and not _valid_peer(ping_ip):
+                self._send(400, {"ok": False,
+                                 "error": f"'{ping_ip}' is not a valid IP address"})
+                return
+            updates[f"{prefix}_PING_IP"] = ping_ip
+        # "url" absent  = leave it alone. "url" present but empty = CLEAR it. Anything else
+        # is a silent surprise: clearing the field in the UI used to do nothing, so commands
+        # kept working through the old address and it looked like the change was ignored.
+        if "url" in body:
+            url = str(body.get("url") or "").strip()
+            if url and not url.startswith(("http://", "https://")):
                 self._send(400, {"ok": False,
                                  "error": "'url' must start with http:// or https://"})
+                return
+            if not url and mode == "relay":
+                self._send(400, {"ok": False,
+                                 "error": "cannot clear the relay URL while mode is "
+                                          "'relay' — switch to 'dds' first"})
                 return
             updates[f"{prefix}_RELAY_URL"] = url
         elif mode == "relay" and not os.environ.get(f"{prefix}_RELAY_URL", "").strip():
