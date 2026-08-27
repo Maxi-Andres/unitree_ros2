@@ -183,7 +183,6 @@ class G1ImageTopicSource(_ParamSource):
             if not (is_comp or is_img):
                 continue
             color = "color" in low or "rgb" in low
-            raw = "image_raw" in low or "image" in low
             # Prefer: compressed+color(0) > compressed(1) > color raw(2) > any(3)
             rank = (0 if (is_comp and color) else 1 if is_comp
                     else 2 if color else 3)
@@ -264,7 +263,7 @@ class HttpStreamSource(_ParamSource):
     working when the robot is NOT on this machine's subnet — which is the normal case once
     the robot is itinerant (field, Starlink, LTE). DDS cannot cross a subnet boundary on
     these robots: measured 122 topics from the robot's own subnet, 2 from another one, 3
-    even with explicit unicast peers. See SplunkCode/RED-Y-DDS.md.
+    even with explicit unicast peers. See robot-splunk-docs/RED-Y-DDS.md.
 
     The video already leaves the robot as H.264 (encoded in hardware on its Jetson, pushed
     over RTMP to mediamtx) and Frigate re-serves it as multipart/x-mixed-replace MJPEG. The
@@ -311,7 +310,7 @@ class HttpStreamSource(_ParamSource):
             while not self._stop.is_set():
                 chunk = resp.read(8192)
                 if not chunk:
-                    raise IOError("stream closed by peer")
+                    raise OSError("stream closed by peer")
                 buf += chunk
                 while True:
                     start = buf.find(b"\xff\xd8")

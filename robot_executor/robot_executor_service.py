@@ -50,9 +50,10 @@ import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
-import go2_commands
 import g1_commands
+import go2_commands
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +81,7 @@ def _as_bool(value, default):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _load_dotenv(os.path.join(_HERE, ".env"))
 
-EXECUTOR_HOST = os.environ.get("EXECUTOR_HOST", "0.0.0.0")
+EXECUTOR_HOST = os.environ.get("EXECUTOR_HOST", "0.0.0.0")  # noqa: S104  # known finding P0-1: binds broadly, no auth yet
 EXECUTOR_PORT = int(os.environ.get("EXECUTOR_PORT", "8090"))
 DEFAULT_ROBOT = os.environ.get("DEFAULT_ROBOT", "go2")
 ROBOT_IP = os.environ.get("ROBOT_IP", "192.168.123.161")  # informational (health/ping)
@@ -267,7 +268,7 @@ def _restart_self():
             pass
     print("[executor] restarting to apply the new DDS transport", flush=True)
     sys.stdout.flush()
-    os.execv("/bin/bash", ["bash", wrapper])
+    os.execv("/bin/bash", ["bash", wrapper])  # noqa: S606  # deliberate self-restart via the launcher: CycloneDDS reads its config once per process
 
 
 def _ensure_rclpy_initialized():
@@ -333,7 +334,7 @@ class RobotTransport(ABC):
         """Perform `skill`. Returns {ok, detail, ...}. Never raises for a normal
         unsupported skill — returns {ok: False, ...} instead."""
 
-    def shutdown(self) -> None:  # optional
+    def shutdown(self) -> None:  # noqa: B027  # optional teardown hook: not every transport has state to release
         pass
 
 
@@ -365,7 +366,6 @@ class Go2Ros2Transport(RobotTransport):
         `_node_lock`. Safe to call any number of times: it brings rclpy back up if a
         fault took it down and destroys a stale node first, so the executor recovers
         on its own instead of getting stuck on 'rclpy.init() has not been called'."""
-        import rclpy
         _ensure_rclpy_initialized()   # re-inits the context if a fault brought it down
         if self._node is not None:
             try:
@@ -395,7 +395,6 @@ class Go2Ros2Transport(RobotTransport):
         req.header.identity.api_id = api_id
         req.header.identity.id = _next_request_id()
         req.parameter = param_str
-        import rclpy
         with self._node_lock:
             if self._node is None or not _rclpy_ok():
                 self._build_node_locked()
@@ -547,7 +546,6 @@ class G1Ros2Transport(RobotTransport):
         per response topic, on a live rclpy context. Self-healing, same contract as the
         Go2 transport. A spin thread is what lets the response callbacks actually run —
         publishers alone need no spinning, subscriptions do."""
-        import rclpy
         _ensure_rclpy_initialized()
         self._stop_spin_locked()
         if self._node is not None:
@@ -624,7 +622,6 @@ class G1Ros2Transport(RobotTransport):
         req.header.identity.api_id = api_id
         req.header.identity.id = request_id
         req.parameter = param_str
-        import rclpy
         with self._node_lock:
             if self._node is None or not _rclpy_ok():
                 self._build_node_locked()
@@ -864,10 +861,10 @@ class RelayTransport(RobotTransport):
 
     WHY: DDS cannot cross a subnet boundary on these robots — measured, 122 topics from the
     robot's own subnet, 2 from another one, 3 even with explicit unicast peers (see
-    SplunkCode/RED-Y-DDS.md). Once the robot is itinerant (field, Starlink, LTE) it will
+    robot-splunk-docs/RED-Y-DDS.md). Once the robot is itinerant (field, Starlink, LTE) it will
     never share a subnet with this machine, so the process that publishes commands has to
     live ON the robot. This transport talks to it over HTTP; the robot-side relay
-    (robot-splunk-bridge/relay/) is what touches DDS.
+    (robot-command-relay/) is what touches DDS.
 
     Skill resolution is reused from go2_commands, so a skill behaves the same over DDS or
     over the WAN. What differs is the ALLOWLIST: only the verbs below can be sent remotely.
@@ -879,7 +876,7 @@ class RelayTransport(RobotTransport):
     robot instead of leaving it walking.
     """
 
-    VERB_FOR_SKILL = {
+    VERB_FOR_SKILL: ClassVar[dict] = {
         "stop": "stop_move",
         "stand_up": "stand_up",
         "stand_down": "stand_down",
@@ -1216,7 +1213,6 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             # rclpy is brought up lazily on the first /execute, so `rclpy_ok` is
             # False until then — informational, never a reason to fail /health.
             try:
-                import rclpy
                 rclpy_ok = bool(_rclpy_ok())
             except Exception:
                 rclpy_ok = False

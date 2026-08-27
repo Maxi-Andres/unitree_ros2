@@ -28,10 +28,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import camera_sources
 import rclpy
 import websocket  # websocket-client
-
-import camera_sources
 
 
 def _load_dotenv(path):
@@ -56,7 +55,7 @@ ROBOT = os.environ.get("CAMERA_ROBOT", "go2")           # go2 | g1 | stream | te
 # "stream" needs no DDS: it reads the video that already left the robot (see
 # camera_sources.HttpStreamSource). Use it whenever the robot is not on this subnet.
 BACKEND_WS_URL = os.environ.get("BACKEND_WS_URL", "wss://localhost:8443/ws/robot-cam")
-CONTROL_HOST = os.environ.get("CAMERA_CONTROL_HOST", "0.0.0.0")
+CONTROL_HOST = os.environ.get("CAMERA_CONTROL_HOST", "0.0.0.0")  # noqa: S104  # known finding P0-1: binds broadly, no auth yet
 CONTROL_PORT = int(os.environ.get("CAMERA_CONTROL_PORT", "8091"))
 START_STREAMING = _as_bool(os.environ.get("START_STREAMING"), False)
 # Passed through to the camera source (fps, resolution, quality, topic…).

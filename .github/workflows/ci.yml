@@ -1,0 +1,19 @@
+name: CI (our code only)
+on: [push, pull_request]
+
+# This is a fork of Unitree's repo. Only robot_executor/ and robot_camera_bridge/ are ours;
+# ruff.toml's `include` and the paths filter below keep CI off the vendor tree.
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"     # the ROS2 Humble devcontainer's interpreter
+      - name: Install tools
+        run: pip install ruff pytest
+      - name: Lint
+        run: ruff check --output-format=github
+      - name: Test the command catalogs
+        run: cd robot_executor && pytest -q
