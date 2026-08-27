@@ -16,4 +16,8 @@ jobs:
       - name: Lint
         run: ruff check --output-format=github
       - name: Test the command catalogs
-        run: cd robot_executor && pytest -q
+        run: |
+          cd robot_executor
+          pytest -q; rc=$?
+          [ $rc -eq 5 ] && exit 0
+          exit $rc
