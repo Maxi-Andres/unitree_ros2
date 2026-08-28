@@ -18,3 +18,9 @@ jobs:
       - name: Test the command catalogs
         # See the note in the sibling repos: `bash -e` makes `; rc=$?` unreachable.
         run: cd robot_executor && { pytest -q || [ $? -eq 5 ]; }
+      - name: Test the camera bridge framing
+        # No cv2 and no rclpy here on purpose — `tests/conftest.py` stubs both, so the
+        # framing loop is testable without the Humble devcontainer. Do NOT add them to the
+        # install step: if the stubs stop being enough, that must fail loudly here rather
+        # than quietly start depending on a 200 MB wheel.
+        run: cd robot_camera_bridge && { pytest -q || [ $? -eq 5 ]; }

@@ -23,3 +23,11 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: pytest-camera-bridge
+        name: pytest (robot_camera_bridge)
+        # Runs outside the devcontainer: tests/conftest.py stubs cv2 and rclpy so the JPEG
+        # framing loop is testable with no ROS2 installed and the robot powered off.
+        entry: bash -c 'cd robot_camera_bridge && python3 -m pytest -q'
+        language: system
+        pass_filenames: false
+        always_run: true
