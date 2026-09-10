@@ -33,17 +33,21 @@ EOI = b"\xff\xd9"
 # Harness
 # --------------------------------------------------------------------------- #
 class _FakeResponse:
-    """Stands in for the object `urlopen` returns: a context manager with `.read(n)`.
+    """Stands in for the object `urlopen` returns: a context manager with `.read1(n)`.
 
     `_read_stream` treats an empty read as a dropped connection and raises `OSError`, which
     the caller (`_run`) turns into a backoff-and-retry. The fake reproduces that, and the
     tests catch it — reaching EOF is the normal way these runs end.
+
+    It deliberately exposes ONLY `read1`, so a regression back to `read()` — which blocks
+    for the full buffer and cost a measured 213 ms per frame — fails loudly here instead of
+    silently adding a frame period to the live view.
     """
 
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
-    def read(self, _size):
+    def read1(self, _size):
         return self._chunks.pop(0) if self._chunks else b""
 
     def __enter__(self):

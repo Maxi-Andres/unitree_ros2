@@ -308,7 +308,20 @@ class HttpStreamSource(_ParamSource):
         with urllib.request.urlopen(req, timeout=10) as resp:
             buf = b""
             while not self._stop.is_set():
-                chunk = resp.read(8192)
+                # read1(), NOT read(): read(n) on a buffered HTTP body blocks until it has
+                # ALL n bytes, so the tail of one frame sits waiting for the head of the
+                # NEXT one to fill the buffer — a full frame period of latency added to
+                # every single frame, on the path you steer by.
+                #
+                # Measured 2026-09-10 against the robot, same stream, same 15 s, the only
+                # difference being this call: read(8192) delivered frames 227.5 ms p50
+                # after the robot published them; read1(8192) delivered them in 14.2 ms.
+                # 213 ms, for one word.
+                #
+                # mjpeg_server.pump() on the robot documents this exact trap and avoids it.
+                # This is its sibling copy of the same SOI/EOI scanner (see the module
+                # docstring) and it had drifted. If you touch one, check the other.
+                chunk = resp.read1(8192)
                 if not chunk:
                     raise OSError("stream closed by peer")
                 buf += chunk
