@@ -287,13 +287,27 @@ class HttpStreamSource(_ParamSource):
         if logger:
             logger.info(f"[camera] HTTP stream source: {url}")
 
+    # A stream that delivered for this long counts as healthy: whatever ended it was a
+    # blip, not a broken configuration, so the next reconnect starts from the short delay.
+    _HEALTHY_S = 5.0
+
     def _run(self):
         backoff = 1.0
         while not self._stop.is_set():
+            started = time.monotonic()
             try:
                 self._read_stream()
-                backoff = 1.0
             except Exception as exc:
+                # Reset the backoff on a stream that ACTUALLY WORKED for a while.
+                #
+                # The reset used to sit right after `self._read_stream()`, which never
+                # returns during normal operation — it only returns once a stop has been
+                # requested — so the reset was unreachable and the backoff only ever grew:
+                # 1, 2, 4, 8, 15, 15, 15… for the rest of the process's life. Measured on
+                # the robot 2026-09-10: the retries in the log were pinned at 15 s, so every
+                # network blip cost fifteen seconds of black screen while driving.
+                if time.monotonic() - started >= self._HEALTHY_S:
+                    backoff = 1.0
                 if self._log and not self._stop.is_set():
                     self._log.warn(f"[camera] stream {self._url} failed: {exc}; "
                                    f"retry in {backoff:.0f}s")

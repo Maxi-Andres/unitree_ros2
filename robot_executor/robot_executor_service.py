@@ -37,6 +37,11 @@ Endpoints:
                                  stack can follow the robot to another network (e.g.
                                  its wlan0 on another VLAN) from the AI-VL page.
     POST /execute {robot, skill, params} -> {ok, robot, skill, detail, ...}
+    GET  /video?robot=go2     -> {running, saved, limits} for the robot's live video knobs
+    POST /video {robot?, fps?, width?, quality?, persist?}
+                              -> retune the robot's live view WITHOUT restarting anything;
+                                 persist=true also writes the robot's video.env. Proxied to
+                                 the on-robot relay, which owns the allowlist and ranges.
 """
 import json
 import os
@@ -234,6 +239,65 @@ def _relay_health(url: str) -> dict:
             return json.loads(r.read() or b"{}")
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _relay_for(robot: str):
+    """(url, token) for a robot's on-robot relay, or (None, reason).
+
+    The URL and the token already live here because this process is the one that talks to
+    the relay. Threading video config through the same place keeps the secret in one
+    process instead of copying it into another.
+    """
+    prefix = robot.upper()
+    url = os.environ.get(f"{prefix}_RELAY_URL", "").strip()
+    if not url:
+        return None, f"{prefix}_RELAY_URL is unset — this robot has no relay configured"
+    token = os.environ.get("RELAY_TOKEN", "").strip()
+    if not token:
+        token_file = os.environ.get("RELAY_TOKEN_FILE",
+                                    os.path.expanduser("~/.relay_token"))
+        if os.path.exists(token_file):
+            with open(token_file, encoding="utf-8") as f:
+                token = f.read().strip()
+    if not token:
+        return None, "no relay token: set RELAY_TOKEN or ~/.relay_token"
+    return (url.rstrip("/"), token), None
+
+
+def _relay_video(robot: str, body=None) -> dict:
+    """GET or POST the relay's /video-config. `body` None = read, dict = write.
+
+    The relay validates against its own allowlist; this is a proxy, deliberately NOT a
+    second validator. One source of truth for the ranges, and it is the one nearest the
+    hardware.
+    """
+    got, err = _relay_for(robot)
+    if err:
+        return {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(
+        url + "/video-config",
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        try:
+            body = json.loads(detail)
+        except ValueError:
+            return {"ok": False, "error": f"HTTP {exc.code}: {detail}"}
+        # Force ok=false on any error status. The relay's own 404 body is just
+        # {"error": "not found"} with no `ok` key, and passing that through unchanged read
+        # as SUCCESS to every caller that branches on `ok !== false` — including the page
+        # that decides whether to show "the robot is not answering".
+        body.setdefault("error", f"HTTP {exc.code}")
+        body["ok"] = False
+        return body
+    except Exception as exc:
+        return {"ok": False, "error": f"relay unreachable: {exc}"}
 
 
 def _transport_config() -> dict:
@@ -1206,6 +1270,16 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         if path == "/transport":
             self._send(200, {"ok": True, "transports": _transport_config()})
             return
+        if path.split("?")[0].rstrip("/") == "/video":
+            # GET /video?robot=go2 -> the robot's live video knobs: running, saved, limits.
+            robot = DEFAULT_ROBOT
+            if "?" in self.path:
+                from urllib.parse import parse_qs, urlparse
+                robot = (parse_qs(urlparse(self.path).query).get(
+                    "robot", [DEFAULT_ROBOT])[0] or DEFAULT_ROBOT)
+            robot = robot.strip().lower()
+            self._send(200, {"robot": robot, **_relay_video(robot)})
+            return
         if path == "/dds":
             cfg = _read_dds_env()
             peers = [p for p in cfg["ROBOT_DDS_PEERS"].split(",") if p.strip()]
@@ -1253,7 +1327,7 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.rstrip("/")
-        if path not in ("/execute", "/dds", "/transport"):
+        if path not in ("/execute", "/dds", "/transport", "/video"):
             self._send(404, {"ok": False, "error": "not found"})
             return
         try:
@@ -1269,6 +1343,11 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
         if path == "/transport":
             self._handle_transport(body)
+            return
+
+        if path == "/video":
+            robot = str(body.pop("robot", None) or DEFAULT_ROBOT).strip().lower()
+            self._send(200, {"robot": robot, **_relay_video(robot, body)})
             return
 
         robot = (body.get("robot") or DEFAULT_ROBOT).strip()

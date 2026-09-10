@@ -18,6 +18,7 @@ marker; do not delete the test.
 """
 from __future__ import annotations
 
+import itertools
 import threading
 import tracemalloc
 import urllib.request
@@ -210,3 +211,76 @@ def test_an_soi_with_no_eoi_does_not_grow_the_buffer_without_bound(monkeypatch):
         f"the scanner held {peak / 1024 / 1024:.1f} MB of a 5 MB unterminated frame; it "
         "needs a ceiling that abandons the frame and resyncs on the next SOI"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Reconnect backoff
+# --------------------------------------------------------------------------- #
+def test_a_stream_that_ran_healthily_reconnects_fast(monkeypatch):
+    """The defect, measured on the robot 2026-09-10: the backoff only ever GREW.
+
+    The reset sat after `self._read_stream()`, which never returns during normal
+    operation — it only returns once a stop is requested — so after a handful of blips
+    every reconnect waited the 15 s ceiling for the rest of the process's life. The robot's
+    log showed exactly that, and each blip cost fifteen seconds of black screen while
+    driving.
+
+    Here the stream runs longer than `_HEALTHY_S` and then dies. The next wait must be the
+    SHORT one, not an escalated one.
+    """
+    src = object.__new__(camera_sources.HttpStreamSource)
+    src._url = "http://stub/stream"
+    src._log = None
+    src._stop = threading.Event()
+
+    waits = []
+    monkeypatch.setattr(src._stop, "wait", lambda s: waits.append(s))
+    # Every read is 100 s apart, so each stream comfortably counts as healthy.
+    clock = itertools.count(0.0, 100.0)
+    monkeypatch.setattr(camera_sources.time, "monotonic", lambda: next(clock))
+
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        if calls["n"] > 2:
+            src._stop.set()
+        raise OSError("blip")
+
+    monkeypatch.setattr(src, "_read_stream", boom)
+    src._run()
+
+    assert waits, "the supervisor never backed off at all"
+    assert all(w == 1.0 for w in waits), (
+        f"a healthy stream escalated the backoff instead of resetting it: {waits}"
+    )
+
+
+def test_a_stream_that_fails_immediately_still_backs_off(monkeypatch):
+    """The other half: a stream that never works (wrong URL, robot down) must NOT hammer.
+    Without this, 'reset on healthy' could be written as 'always reset' and nobody notices.
+    """
+    src = object.__new__(camera_sources.HttpStreamSource)
+    src._url = "http://stub/stream"
+    src._log = None
+    src._stop = threading.Event()
+
+    waits = []
+    monkeypatch.setattr(src._stop, "wait", lambda s: waits.append(s))
+    # 0.1 s apart: every stream dies well inside _HEALTHY_S.
+    clock = itertools.count(0.0, 0.1)
+    monkeypatch.setattr(camera_sources.time, "monotonic", lambda: next(clock))
+
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        if calls["n"] > 3:
+            src._stop.set()
+        raise OSError("refused")
+
+    monkeypatch.setattr(src, "_read_stream", boom)
+    src._run()
+
+    assert waits == [1.0, 2.0, 4.0, 8.0], (
+        f"backoff did not escalate on a dead stream: {waits}")

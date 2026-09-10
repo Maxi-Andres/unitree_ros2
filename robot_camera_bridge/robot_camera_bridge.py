@@ -24,6 +24,7 @@ Endpoints (control):
 import json
 import os
 import ssl
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +51,27 @@ def _as_bool(v, default):
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _load_dotenv(os.path.join(_HERE, ".env"))
+
+# Whether the operator asked for streaming, remembered across process restarts.
+#
+# WHY: run_camera_bridge.sh supervises this process now, but a supervisor that brings the
+# bridge back NOT streaming leaves the drive view just as dark as no supervisor at all —
+# the frontend only sends /start when the page mounts, so nothing re-asks after a crash.
+# The flag records the operator's INTENT, so a restart resumes what they wanted. It is
+# written only by /start and /stop, never by the shutdown path, so exiting cleanly does
+# not look like "the operator turned it off".
+_STREAMING_FLAG = os.path.join(_HERE, ".streaming")
+
+
+def _remember_streaming(on):
+    try:
+        if on:
+            open(_STREAMING_FLAG, "w").close()
+        elif os.path.exists(_STREAMING_FLAG):
+            os.remove(_STREAMING_FLAG)
+    except OSError as exc:                     # never let bookkeeping break the stream
+        print(f"[camera] could not record streaming state: {exc}", flush=True)
+
 
 ROBOT = os.environ.get("CAMERA_ROBOT", "go2")           # go2 | g1 | stream | test
 # "stream" needs no DDS: it reads the video that already left the robot (see
@@ -242,9 +264,11 @@ class ControlHandler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         if path == "/start":
             self.bridge.start()
+            _remember_streaming(True)
             self._send(200, {"ok": True, "robot": ROBOT, **self.bridge.status()})
         elif path == "/stop":
             self.bridge.stop()
+            _remember_streaming(False)
             self._send(200, {"ok": True, "robot": ROBOT, **self.bridge.status()})
         elif path == "/config":
             # {robot?, fps?, resolution?, quality?} — switch the camera source robot
@@ -279,22 +303,40 @@ def main():
     server = ThreadingHTTPServer((CONTROL_HOST, CONTROL_PORT), ControlHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    if START_STREAMING:
+    resumed = os.path.exists(_STREAMING_FLAG)
+    if START_STREAMING or resumed:
         bridge.start()
+        if resumed:
+            print("[camera] resuming streaming after a restart", flush=True)
+    # Report the ACTUAL state, not the env default: since a restart resumes the operator's
+    # last intent, printing START_STREAMING here said "streaming=False" on a process that
+    # was in fact streaming.
     print(f"robot_camera_bridge: robot={ROBOT} control=:{CONTROL_PORT} "
-          f"streaming={START_STREAMING} -> {BACKEND_WS_URL}", flush=True)
+          f"streaming={bridge.status()['streaming']} -> {BACKEND_WS_URL}", flush=True)
 
+    stopped_externally = False
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except rclpy.executors.ExternalShutdownException:
+        # Something tore the ROS context down under us. Until 2026-09-10 this escaped as a
+        # traceback, and since the launcher used `exec` with no supervisor the drive view
+        # just went dark until a human noticed. Exit non-zero instead so the supervision
+        # loop in run_camera_bridge.sh brings the bridge straight back.
+        stopped_externally = True
     finally:
         bridge.stop()
         server.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+    if stopped_externally:
+        print("[camera] ROS context shut down externally; exiting for a restart",
+              file=sys.stderr, flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
