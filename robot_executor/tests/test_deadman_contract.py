@@ -22,10 +22,13 @@ edits, which is what makes the refactor provably behaviour-preserving.
 The per-transport `_Seam` adapters below are the *measure* of the duplication. When the base
 class lands, they collapse to one.
 
-TWO XFAILS, BOTH ON THE RELAY. Parametrising surfaced that the three copies have already
-drifted apart — the relay's loop is NOT a copy of the other two. Both are marked
-`xfail(strict=True)` against the relay only, so they flip to a hard failure the moment the
-refactor fixes them and the markers have to go. See the section at the bottom.
+THE TWO RELAY XFAILS ARE GONE — FIXED 2026-09-10. Parametrising surfaced that the three
+copies had drifted apart: the relay's loop was NOT a copy of the other two. Both defects
+were confirmed against the real robot by sniffing tcp/8092 during teleop (154 of 155 moves
+preceded by an injected halt), then fixed by copying the `if reached_deadline` guard and the
+step clamp from the ROS2 transports. `strict=True` did its job — the markers turned into
+hard failures the moment the code was right, and were removed. All three transports now
+pass every row. Analysis: robot-splunk-docs/FRENO-INYECTADO.md
 """
 from __future__ import annotations
 
@@ -251,21 +254,18 @@ def test_an_unsupported_skill_is_refused_without_sending_anything(build, make):
 
 
 # --------------------------------------------------------------------------- #
-# Where the three copies have DRIFTED — open defects, relay only
+# Where the three copies HAD drifted — fixed 2026-09-10, kept as regression rows
 #
-# These two are the concrete cost of the duplication: the relay's loop is not a copy of the
-# other two any more, and nobody noticed because nothing compared them. The planned
-# template-method base class fixes both by construction.
+# These two were the concrete cost of the duplication: the relay's loop was not a copy of
+# the other two any more, and nobody noticed because nothing compared them. They ran as
+# xfail(strict=True) until the guard and the clamp were copied over from the ROS2
+# transports. They stay parametrised across all three so the drift cannot come back, and
+# the planned template-method base class keeps them passing by construction.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("make", [
     pytest.param(_go2_seam, id="go2-ros2"),
     pytest.param(_g1_seam, id="g1-ros2"),
-    pytest.param(_relay_seam, id="relay", marks=pytest.mark.xfail(
-        strict=True,
-        reason="RelayTransport._run_move_loop posts {'verb':'stop_move'} AFTER the while "
-               "loop unconditionally, not only when the deadline was reached. So every "
-               "teleop refresh injects a halt: move-halt-move-halt instead of smooth "
-               "motion. Go2 and G1 both guard it with `if reached_deadline`.")),
+    pytest.param(_relay_seam, id="relay"),
 ])
 def test_a_new_move_supersedes_the_previous_one_without_injecting_a_halt(build, make):
     """The invariant that makes teleop smooth, and the one a refactor breaks first.
@@ -287,14 +287,7 @@ def test_a_new_move_supersedes_the_previous_one_without_injecting_a_halt(build, 
 @pytest.mark.parametrize("make", [
     pytest.param(_go2_seam, id="go2-ros2"),
     pytest.param(_g1_seam, id="g1-ros2"),
-    pytest.param(_relay_seam, id="relay", marks=pytest.mark.xfail(
-        strict=True,
-        reason="RelayTransport._start_move computes `deadline = now + (duration or "
-               "DEFAULT_STEP_S)` with NO clamp. The `max(0.1, min(step, MAX_STEP_S))` guard "
-               "exists only in the two ROS2 transports (:449 and :761). So duration_s=60 on "
-               "the relay path is a 60-second walk, and the robot-side dead-man does not "
-               "save it: the loop keeps posting every _REFRESH_S, feeding that dead-man. "
-               "This is the path built for the ITINERANT robot, in the field.")),
+    pytest.param(_relay_seam, id="relay"),
 ])
 def test_an_absurd_duration_is_clamped_to_max_step(build, make):
     """The defect: trusting the caller's duration, so `duration_s: 60` is a de-facto

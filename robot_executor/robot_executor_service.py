@@ -926,20 +926,48 @@ class RelayTransport(RobotTransport):
         self._move_thread = None
 
     def _run_move_loop(self, vx, vy, vyaw, deadline):
-        """Re-send the movement until told to stop, feeding the relay's dead-man switch."""
-        while not self._move_stop.is_set():
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            self._post({"verb": "move", "vx": vx, "vy": vy, "vyaw": vyaw})
-            self._move_stop.wait(self._REFRESH_S)
-        self._post({"verb": "stop_move"})
+        """Re-send the movement until told to stop, feeding the relay's dead-man switch.
+
+        stop_move is posted ONLY when the deadline is actually reached — NOT when a newer
+        move supersedes this loop. Same contract as the two ROS2 transports; see
+        Go2Ros2Transport._run_move_loop for the full rationale.
+
+        WHY THIS GUARD IS NOT COSMETIC, measured 2026-09-10 against the robot in the field:
+        posting the halt here is a BLOCKING HTTP round trip, and `_start_move` waits for
+        this thread to finish before sending the new move. So the halt window is not a
+        constant — it is roughly 2.5x the link RTT, and the robot is genuinely stopped for
+        all of it. Sniffing tcp/8092 for 30 s of teleop showed 154 of 155 moves (99%)
+        preceded by a halt. On the cable link that was 15 ms out of a 155 ms teleop cycle
+        (10%, imperceptible); over LTE, at 46 ms mean / 95 ms peak RTT, the same code halts
+        for 115-240 ms of every 155 ms cycle — the robot brakes more than it walks. That is
+        the "micro tirones" symptom, and it is why the symptom vanished when the robot moved
+        to cable without anything being fixed. Full analysis and the re-measurement protocol
+        for LTE and Starlink: robot-splunk-docs/FRENO-INYECTADO.md
+        """
+        reached_deadline = False
+        try:
+            while not self._move_stop.is_set():
+                if deadline is not None and time.monotonic() >= deadline:
+                    reached_deadline = True
+                    break
+                self._post({"verb": "move", "vx": vx, "vy": vy, "vyaw": vyaw})
+                self._move_stop.wait(self._REFRESH_S)
+        finally:
+            if reached_deadline:
+                self._post({"verb": "stop_move"})
 
     def _start_move(self, vx, vy, vyaw, duration, continuous):
         with self._move_lock:
             self._stop_move_loop()
             self._move_stop = threading.Event()
-            deadline = None if continuous else \
-                time.monotonic() + (duration or DEFAULT_STEP_S)
+            deadline = None
+            if not continuous:
+                # Clamped exactly like the ROS2 transports: an unclamped duration is a walk
+                # the robot-side dead-man cannot cut short, because this loop keeps feeding
+                # it every _REFRESH_S. This is the transport built for the ITINERANT robot.
+                step = duration if duration else DEFAULT_STEP_S
+                step = max(0.1, min(step, MAX_STEP_S))
+                deadline = time.monotonic() + step
             self._move_thread = threading.Thread(
                 target=self._run_move_loop, args=(vx, vy, vyaw, deadline),
                 name=f"relay-move-{self._robot}", daemon=True)
