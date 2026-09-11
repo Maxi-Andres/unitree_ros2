@@ -74,7 +74,7 @@ def _source(monkeypatch, chunks, on_frame, fps_gate=False):
     src._res = "native"   # with quality 0 this is the passthrough path: no cv2
     src._quality = 0
     src._fps = 1.0
-    src._last = 0.0
+    src._passed = 0.0
     if not fps_gate:
         monkeypatch.setattr(src, "_due", lambda: True)
     monkeypatch.setattr(urllib.request, "urlopen",
@@ -133,15 +133,39 @@ def test_multipart_headers_before_the_soi_are_discarded(monkeypatch):
     assert _run(monkeypatch, [preamble + _frame(b"x")]) == [_frame(b"x")]
 
 
-def test_two_frames_in_one_chunk_are_both_forwarded(monkeypatch):
-    """The defect: an inner loop that stops after one frame, halving the frame rate."""
+def test_only_the_newest_frame_of_a_backlog_is_forwarded(monkeypatch):
+    """DELIBERATE behaviour change, 2026-09-11. This used to assert that both frames were
+    forwarded; now only the newest is, and that is the fix for the "slow motion" symptom.
+
+    Several complete frames only pile up in the buffer when reads outran the scanner —
+    i.e. TCP stalled and then delivered a backlog (the tunnel reorders ~2% of segments,
+    measured). Forwarding that backlog in order means the operator watches the queue
+    drain: old pictures, correctly ordered, at the wrong time. On a view someone steers
+    by, every frame but the last is worthless the moment a newer one exists.
+
+    Same discipline as `Latest` in the robot's mjpeg_server: "a queue is how latency
+    accumulates". `test_every_frame_is_forwarded_when_they_arrive_one_per_read` below is
+    the guard that this does NOT silently halve the rate in normal operation.
+    """
     a, b = _frame(b"first"), _frame(b"second")
-    assert _run(monkeypatch, [a + b]) == [a, b]
+    assert _run(monkeypatch, [a + b]) == [b]
+
+
+def test_every_frame_is_forwarded_when_they_arrive_one_per_read(monkeypatch):
+    """The concern the old two-frames test really protected: that nothing above quietly
+    halves the frame rate.
+
+    This is the NORMAL case and the one that matters — a 212 KB frame arrives over ~26
+    reads of 8 KB, so a single read can never complete two frames. Each scan therefore
+    sees exactly one, and every one must go through.
+    """
+    frames = [_frame(b"one"), _frame(b"two"), _frame(b"three")]
+    assert _run(monkeypatch, frames) == frames
 
 
 def test_bytes_between_two_frames_are_discarded(monkeypatch):
     a, b = _frame(b"first"), _frame(b"second")
-    assert _run(monkeypatch, [a + b"\r\n--frame\r\n" + b]) == [a, b]
+    assert _run(monkeypatch, [a + b"\r\n--frame\r\n" + b]) == [b]
 
 
 def test_a_chunk_with_no_markers_forwards_nothing(monkeypatch):
@@ -284,3 +308,68 @@ def test_a_stream_that_fails_immediately_still_backs_off(monkeypatch):
 
     assert waits == [1.0, 2.0, 4.0, 8.0], (
         f"backoff did not escalate on a dead stream: {waits}")
+
+
+# --------------------------------------------------------------------------- #
+# The fps gate
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("source_fps, cap, expect_min", [
+    (14.8, 15.0, 0.90),   # the real one: source a hair UNDER the cap
+    (15.0, 15.0, 0.90),   # exactly at it
+    (10.0, 15.0, 0.95),   # comfortably under: everything should pass
+    (30.0, 15.0, 0.45),   # genuinely over: the cap SHOULD halve it
+])
+def test_the_fps_gate_does_not_halve_a_source_running_near_the_cap(
+        monkeypatch, source_fps, cap, expect_min):
+    """The defect, measured against the robot 2026-09-11: source 14.8 fps, cap 15 fps,
+    delivered 8.3 fps — the gate threw away 43% of the video.
+
+    The old gate reset its clock to each accepted frame's ARRIVAL time, so a frame landing
+    a hair early was dropped and the next was a whole extra period away. Source and cap
+    then beat against each other and the output collapsed to about half.
+
+    JITTER IS THE POINT and the test is worthless without it: with perfectly even arrivals
+    a 14.8 fps source clears a 15 fps gate every time and the bug does not show. Real
+    frames come off a polling loop over DDS and wobble by milliseconds, which is what makes
+    some of them land early. The wobble here is deterministic, not random — a flaky test
+    would be worse than none.
+
+    `expect_min` is the fraction of the achievable rate that must get through. The last row
+    is the control: a source genuinely above the cap must still be cut down, or "fixing"
+    this would just mean deleting the gate.
+    """
+    src = object.__new__(camera_sources._ParamSource)
+    src._fps = cap
+    src._passed = 0.0
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(camera_sources.time, "monotonic", lambda: clock["t"])
+
+    period = 1.0 / source_fps
+    wobble = [0.0, -0.004, 0.003, -0.002, 0.005, -0.003, 0.001, -0.005]
+    passed = 0
+    for i in range(400):
+        clock["t"] += period + wobble[i % len(wobble)]
+        if src._due():
+            passed += 1
+    fraction = passed / 400
+    achievable = min(1.0, cap / source_fps)
+    assert fraction >= expect_min * achievable, (
+        f"source {source_fps} fps against a {cap} fps cap delivered only "
+        f"{fraction * 100:.0f}% of its frames (achievable {achievable * 100:.0f}%)")
+
+
+def test_the_fps_gate_does_not_burst_after_a_stall(monkeypatch):
+    """The other half: after a long gap the gate must not release a catch-up burst.
+    A burst is how a queue's worth of latency arrives all at once, which on the view you
+    steer by looks like the picture jumping."""
+    src = object.__new__(camera_sources._ParamSource)
+    src._fps = 10.0
+    src._passed = 0.0
+    clock = {"t": 0.0}
+    monkeypatch.setattr(camera_sources.time, "monotonic", lambda: clock["t"])
+
+    clock["t"] = 100.0          # a 100 s stall
+    assert src._due()
+    clock["t"] += 0.001         # frames now arriving fast
+    assert not src._due(), "the gate released a second frame 1 ms after the first"

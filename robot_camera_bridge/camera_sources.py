@@ -71,18 +71,46 @@ class _ParamSource:
     from the HTTP control thread."""
 
     _POLL_HZ = 30.0
+    # How early a frame may arrive and still count. Real frames come off a polling loop
+    # over DDS and wobble by a few ms; without slack, a source running just UNDER the cap
+    # has half its frames land a hair early and be thrown away. Measured with the four
+    # scenarios in the tests: 10% slack delivers 100% of a 14.8 fps source under a 15 fps
+    # cap and still halves a 30 fps one, which is exactly the job.
+    _JITTER_TOLERANCE = 0.90
 
     def __init__(self, fps, resolution, quality):
         self._fps = max(1.0, min(self._POLL_HZ, float(fps)))
         self._res = resolution if resolution in _RES_HEIGHTS else "native"
         self._quality = int(quality or 0)
-        self._last = 0.0
+        self._passed = 0.0   # monotonic time of the last frame the gate let through
 
     def _due(self):
+        """Rate gate: cap the frame rate without destroying a source running near it.
+
+        The old version reset the clock to the arrival time of each accepted frame:
+
+            if now - self._last < 1.0 / self._fps: return False
+            self._last = now
+
+        which beats badly when the source runs just UNDER the cap. A frame landing a hair
+        early is dropped, and the next one is then a whole extra period away, so the output
+        collapses to roughly half the source rate. Measured against the robot 2026-09-11:
+        source 14.8 fps, cap 15 fps, delivered 8.3 fps — 43% of the video thrown away by
+        the thing meant to be letting it through. Raising the cap to 30 restored 13.7 fps
+        immediately, which is what identified this.
+
+        The fix is a small tolerance on the period rather than a stricter clock: a frame
+        may arrive up to `_JITTER_TOLERANCE` of a period early and still count. That
+        absorbs the source's wobble without letting a genuinely faster source through —
+        measured, a 30 fps source under a 15 fps cap is still halved — and it releases no
+        catch-up burst after a stall, which is how latency would otherwise arrive all at
+        once on the view you steer by.
+        """
         now = time.monotonic()
-        if now - self._last < 1.0 / self._fps:
+        period = 1.0 / self._fps   # _fps is clamped to >= 1.0 in __init__ and set_params
+        if now - self._passed < period * self._JITTER_TOLERANCE:
             return False
-        self._last = now
+        self._passed = now
         return True
 
     def set_params(self, fps=None, resolution=None, quality=None):
@@ -339,6 +367,21 @@ class HttpStreamSource(_ParamSource):
                 if not chunk:
                     raise OSError("stream closed by peer")
                 buf += chunk
+                # Scan out every COMPLETE frame this read made available, then forward
+                # only the NEWEST of them.
+                #
+                # WHY, and this is the whole "slow motion" symptom: TCP stalls (the tunnel
+                # reorders ~2% of segments, measured 2026-09-11) and then delivers a
+                # backlog all at once. Forwarding that backlog frame by frame means the
+                # operator watches the queue drain — old pictures, in order, at the wrong
+                # time. For a view someone steers by, every frame but the last one is
+                # already worthless the moment a newer one exists.
+                #
+                # mjpeg_server's `Latest` on the robot says the same thing in its
+                # docstring: "deliberately not a queue: a queue is how latency
+                # accumulates". This is the sibling copy of that discipline, and it was
+                # missing here.
+                newest = None
                 while True:
                     start = buf.find(b"\xff\xd8")
                     if start < 0:
@@ -350,13 +393,13 @@ class HttpStreamSource(_ParamSource):
                         if start > 0:
                             buf = buf[start:]
                         break
-                    frame = buf[start:end + 2]
+                    newest = buf[start:end + 2]
                     buf = buf[end + 2:]
-                    if self._due():
-                        jpg = _reprocess(jpeg=frame, resolution=self._res,
-                                         quality=self._quality)
-                        if jpg:
-                            self._on_frame(jpg)
+                if newest is not None and self._due():
+                    jpg = _reprocess(jpeg=newest, resolution=self._res,
+                                     quality=self._quality)
+                    if jpg:
+                        self._on_frame(jpg)
 
     def close(self):
         self._stop.set()

@@ -27,12 +27,29 @@ echo "[camera] ROS2 env sourced; starting robot_camera_bridge.py …"
 # Deliberately NOT `set -e`: a supervisor that exits when its child fails is not a
 # supervisor. This is the exception the engineering standard §6 names, and the same shape
 # robot-video-pipeline/robot/run-video.sh already uses on the robot.
+#
+# The delay BACKS OFF, and that is not decoration. The first version restarted every 2 s
+# unconditionally; when a second copy of this script was already running and holding the
+# control port, the loser hot-looped forever — measured 2026-09-11: three supervisors
+# alive at once, 619 restarts, ~1 per second. Every failed start opens a fresh full-rate
+# stream from the robot before dying, so a loop like that is not idle, it is load.
 running=1
+delay=2
 trap 'running=0' INT TERM
 while [ "$running" = 1 ]; do
+  started=$SECONDS
   python3 "$HERE/robot_camera_bridge.py"
   rc=$?
   [ "$running" = 1 ] || break
-  echo "[camera] bridge exited (rc=$rc); restarting in 2s" >&2
-  sleep 2
+  # Exit code 3 means another instance already owns the control port. Restarting cannot
+  # help — that instance IS the service — so step aside instead of fighting it.
+  if [ "$rc" = 3 ]; then
+    echo "[camera] another bridge already owns the control port; leaving it alone" >&2
+    exit 0
+  fi
+  # A run that lasted a while was healthy: whatever ended it was a blip, so retry fast.
+  if [ $((SECONDS - started)) -ge 30 ]; then delay=2; fi
+  echo "[camera] bridge exited (rc=$rc); restarting in ${delay}s" >&2
+  sleep "$delay"
+  delay=$(( delay < 30 ? delay * 2 : 30 ))
 done

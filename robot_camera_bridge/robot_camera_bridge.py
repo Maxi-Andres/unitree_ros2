@@ -300,7 +300,21 @@ def main():
 
     ControlHandler.bridge = bridge
     ControlHandler.mgr = mgr
-    server = ThreadingHTTPServer((CONTROL_HOST, CONTROL_PORT), ControlHandler)
+    try:
+        server = ThreadingHTTPServer((CONTROL_HOST, CONTROL_PORT), ControlHandler)
+    except OSError as exc:
+        # Almost always "address already in use": another bridge is running and IS the
+        # service. Exit 3 so the supervisor stands down instead of restarting into the
+        # same collision forever — which is what three stacked supervisors did on
+        # 2026-09-11, one failed start per second, each one opening a full-rate stream
+        # from the robot on its way out.
+        print(f"[camera] cannot bind {CONTROL_HOST}:{CONTROL_PORT}: {exc}",
+              file=sys.stderr, flush=True)
+        bridge.stop()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 3
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     resumed = os.path.exists(_STREAMING_FLAG)
