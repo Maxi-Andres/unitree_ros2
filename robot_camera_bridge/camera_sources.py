@@ -18,6 +18,7 @@ Sources:
 All sources share fps/resolution/quality params (set at build, live-tunable via the
 bridge's /config), and a close() so the bridge can switch source robot at runtime.
 """
+import os
 import threading
 import time
 import urllib.request
@@ -435,6 +436,93 @@ class TestPatternSource(_ParamSource):
             pass
 
 
+class RtspStreamSource(_ParamSource):
+    """Read the robot's H.264 from mediamtx, so the robot sends ONE stream and not two.
+
+    WHY THIS EXISTS. The robot already encodes H.264 in hardware and pushes it to mediamtx.
+    Pulling MJPEG off the robot as well means the same picture leaves it twice, and the MJPEG
+    copy is the expensive one: measured 2026-09-11, 8.9 Mbps PER VIEWER against 1.4 Mbps for
+    the H.264, because the robot serves a full copy to every HTTP viewer while mediamtx fans
+    the H.264 out here at HQ. Taking detection off the robot's MJPEG is what lets that second
+    stream be switched off entirely.
+
+    NOT via Frigate. Frigate re-serves the same H.264 as MJPEG and would need no decoder
+    here, but it is an NVR and buffers on purpose — ~7 s, measured. Boxes drawn from a
+    7-second-old frame over a 200 ms live view are worse than no boxes. mediamtx's RTSP is
+    the short path.
+
+    The trade is a decode: frames arrive as H.264, so unlike the MJPEG sources there is no
+    pass-through and every frame is decoded and re-encoded to JPEG for the backend. That
+    costs a few ms per frame on a workstation, and it happens at HQ rather than on the
+    robot's Jetson, which is the machine that has no headroom.
+    """
+
+    # Matches HttpStreamSource: a stream that ran this long was working, so whatever ended
+    # it was a blip and the next reconnect starts from the short delay.
+    _HEALTHY_S = 5.0
+    # FFmpeg options, passed the only way OpenCV accepts them. tcp because the tunnel to HQ
+    # reorders; nobuffer/low_delay because the default is tuned for playback smoothness, not
+    # for a view someone steers by; stimeout so a dead link raises instead of blocking the
+    # reader thread forever.
+    _FFMPEG_OPTS = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;5000000"
+
+    def __init__(self, node, on_frame, url, fps=15, resolution="native", quality=0,
+                 logger=None):
+        # quality 0 means "forward the source JPEG untouched" everywhere else; here there is
+        # no source JPEG, so it would mean "encode at the _reprocess default". Pin it to
+        # something explicit instead of inheriting that surprise.
+        super().__init__(fps, resolution, quality or 75)
+        self._on_frame = on_frame
+        self._url = url
+        self._log = logger
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="rtsp-stream", daemon=True)
+        self._thread.start()
+        if logger:
+            logger.info(f"[camera] RTSP/H.264 source: {url}")
+
+    def _run(self):
+        backoff = 1.0
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                self._read_stream()
+            except Exception as exc:
+                if time.monotonic() - started >= self._HEALTHY_S:
+                    backoff = 1.0
+                if self._log and not self._stop.is_set():
+                    self._log.warn(f"[camera] rtsp {self._url} failed: {exc}; "
+                                   f"retry in {backoff:.0f}s")
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, 15.0)
+
+    def _read_stream(self):
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._FFMPEG_OPTS
+        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+        # One frame of decoder buffer. Anything deeper is latency that arrives as a burst of
+        # stale pictures after a stall — the "slow motion" symptom the MJPEG source documents.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        try:
+            if not cap.isOpened():
+                raise OSError("could not open stream")
+            while not self._stop.is_set():
+                ok, bgr = cap.read()
+                if not ok:
+                    raise OSError("stream ended")
+                # DECODE every frame, FORWARD only the ones the rate gate allows. Skipping
+                # the read to save work would back the decoder up instead, and the backlog
+                # would come out later as stale frames.
+                if not self._due():
+                    continue
+                self._on_frame(_reprocess(bgr=bgr, resolution=self._res,
+                                          quality=self._quality))
+        finally:
+            cap.release()
+
+    def close(self):
+        self._stop.set()
+
+
 def build_source(robot, node, on_frame, cfg, logger=None):
     """Factory: pick the CameraSource for `robot` using cfg (env-derived)."""
     if robot == "go2":
@@ -465,10 +553,15 @@ def build_source(robot, node, on_frame, cfg, logger=None):
             resolution=cfg.get("G1_RESOLUTION", "native"),
             quality=0, logger=logger)
     if robot == "stream":
-        # No robot subnet required: reads the video that already left the robot.
-        return HttpStreamSource(
+        # No robot subnet required: reads the video that already left the robot. The URL's
+        # SCHEME picks the reader, so pointing STREAM_URL at mediamtx's RTSP is all it takes
+        # to stop pulling a second copy off the robot — no new mode to remember, and the
+        # existing go2|g1|stream|test switch keeps working untouched.
+        url = cfg.get("STREAM_URL", "http://127.0.0.1:5000/api/robot")
+        source = RtspStreamSource if url.startswith(("rtsp://", "rtsps://")) else HttpStreamSource
+        return source(
             node, on_frame,
-            url=cfg.get("STREAM_URL", "http://127.0.0.1:5000/api/robot"),
+            url=url,
             fps=float(cfg.get("STREAM_FPS", 15)),
             resolution=cfg.get("STREAM_RESOLUTION", "native"),
             quality=int(cfg.get("STREAM_QUALITY", 0) or 0), logger=logger)
