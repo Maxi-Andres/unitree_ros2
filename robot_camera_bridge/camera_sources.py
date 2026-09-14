@@ -324,6 +324,12 @@ class HttpStreamSource(_ParamSource):
         backoff = 1.0
         while not self._stop.is_set():
             started = time.monotonic()
+            # A reconnect starts a new stream with a new timebase, so the lag measured
+            # against the old one means nothing. The PEAK is deliberately not reset: it is
+            # the only record that the last stream went bad, and clearing it on reconnect
+            # would hide exactly the failure this is here to catch.
+            self._lag = 0.0
+            self._last_lag_warn = 0.0
             try:
                 self._read_stream()
             except Exception as exc:
@@ -342,6 +348,43 @@ class HttpStreamSource(_ParamSource):
                                    f"retry in {backoff:.0f}s")
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 15.0)
+
+    def _track_lag(self, elapsed_s, stream_s):
+        """How far behind the stream this reader has fallen, without any clock agreement.
+
+        A *pull* reader slower than its source does not settle at a lower frame rate: the
+        backlog upstream grows without bound and the latency climbs forever. That failure is
+        invisible for the first seconds and obvious only after minutes, which is exactly how
+        it shipped once and took the drive view to ~8 s.
+
+        The measure needs no synchronised clock, only two elapsed times compared:
+
+            lag = (our monotonic seconds since the first frame)
+                - (the stream's own presentation seconds over the same frames)
+
+        Both start at the same frame, so the unknown offset between the two clocks cancels
+        and only their RATES are compared. Keeping up holds this at ~0; falling behind grows
+        it by exactly the latency being accumulated. Absolute glass-to-glass is a different
+        question and this does not answer it — this answers "am I the one adding to it".
+        """
+        self._lag = elapsed_s - stream_s
+        self._lag_peak = max(self._lag_peak, self._lag)
+        if self._lag < self._LAG_WARN_S or not self._log:
+            return
+        now = time.monotonic()
+        if now - self._last_lag_warn < self._LAG_WARN_EVERY_S:
+            return
+        self._last_lag_warn = now
+        self._log.warn(
+            f"[camera] rtsp reader is {self._lag:.1f}s behind its source and cannot catch up "
+            f"on its own (peak {self._lag_peak:.1f}s). Frames are queueing upstream, not "
+            f"being dropped, so this latency is permanent until the stream is reopened.")
+
+    def get_params(self):
+        # Surfaced through the bridge's /status so the lag is visible WITHOUT reading logs —
+        # this is the number that decides whether the drive view can be trusted.
+        return {**super().get_params(),
+                "lag_s": round(self._lag, 2), "lag_peak_s": round(self._lag_peak, 2)}
 
     def _read_stream(self):
         # Scan for JPEG SOI/EOI markers rather than parsing multipart boundaries: it is
@@ -465,6 +508,11 @@ class RtspStreamSource(_ParamSource):
     # for a view someone steers by; stimeout so a dead link raises instead of blocking the
     # reader thread forever.
     _FFMPEG_OPTS = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;5000000"
+    # Lag past which the reader is told it is losing the race. One second is already far
+    # more than the whole rest of the path costs, so anything over it is a defect and not
+    # jitter; the log is throttled to this many seconds so a bad night is not a log flood.
+    _LAG_WARN_S = 1.0
+    _LAG_WARN_EVERY_S = 30.0
 
     def __init__(self, node, on_frame, url, fps=15, resolution="native", quality=0,
                  logger=None):
@@ -476,6 +524,9 @@ class RtspStreamSource(_ParamSource):
         self._url = url
         self._log = logger
         self._stop = threading.Event()
+        self._lag = 0.0          # seconds this reader is behind the stream's own timebase
+        self._lag_peak = 0.0     # worst since the process started, for after-the-fact triage
+        self._last_lag_warn = 0.0
         self._thread = threading.Thread(target=self._run, name="rtsp-stream", daemon=True)
         self._thread.start()
         if logger:
@@ -485,6 +536,12 @@ class RtspStreamSource(_ParamSource):
         backoff = 1.0
         while not self._stop.is_set():
             started = time.monotonic()
+            # A reconnect starts a new stream with a new timebase, so the lag measured
+            # against the old one means nothing. The PEAK is deliberately not reset: it is
+            # the only record that the last stream went bad, and clearing it on reconnect
+            # would hide exactly the failure this is here to catch.
+            self._lag = 0.0
+            self._last_lag_warn = 0.0
             try:
                 self._read_stream()
             except Exception as exc:
@@ -496,6 +553,43 @@ class RtspStreamSource(_ParamSource):
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 15.0)
 
+    def _track_lag(self, elapsed_s, stream_s):
+        """How far behind the stream this reader has fallen, without any clock agreement.
+
+        A *pull* reader slower than its source does not settle at a lower frame rate: the
+        backlog upstream grows without bound and the latency climbs forever. That failure is
+        invisible for the first seconds and obvious only after minutes, which is exactly how
+        it shipped once and took the drive view to ~8 s.
+
+        The measure needs no synchronised clock, only two elapsed times compared:
+
+            lag = (our monotonic seconds since the first frame)
+                - (the stream's own presentation seconds over the same frames)
+
+        Both start at the same frame, so the unknown offset between the two clocks cancels
+        and only their RATES are compared. Keeping up holds this at ~0; falling behind grows
+        it by exactly the latency being accumulated. Absolute glass-to-glass is a different
+        question and this does not answer it — this answers "am I the one adding to it".
+        """
+        self._lag = elapsed_s - stream_s
+        self._lag_peak = max(self._lag_peak, self._lag)
+        if self._lag < self._LAG_WARN_S or not self._log:
+            return
+        now = time.monotonic()
+        if now - self._last_lag_warn < self._LAG_WARN_EVERY_S:
+            return
+        self._last_lag_warn = now
+        self._log.warn(
+            f"[camera] rtsp reader is {self._lag:.1f}s behind its source and cannot catch up "
+            f"on its own (peak {self._lag_peak:.1f}s). Frames are queueing upstream, not "
+            f"being dropped, so this latency is permanent until the stream is reopened.")
+
+    def get_params(self):
+        # Surfaced through the bridge's /status so the lag is visible WITHOUT reading logs —
+        # this is the number that decides whether the drive view can be trusted.
+        return {**super().get_params(),
+                "lag_s": round(self._lag, 2), "lag_peak_s": round(self._lag_peak, 2)}
+
     def _read_stream(self):
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._FFMPEG_OPTS
         cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
@@ -505,14 +599,40 @@ class RtspStreamSource(_ParamSource):
         try:
             if not cap.isOpened():
                 raise OSError("could not open stream")
+            # grab() first, retrieve() only for the frames actually forwarded.
+            #
+            # What this saves, precisely, because it was once believed to save more. In
+            # OpenCV's FFmpeg backend grab() still DECODES the frame; retrieve() is only the
+            # YUV->BGR conversion. So this removes the conversion and the JPEG encode from
+            # every dropped frame — real work, and it took the encode rate from 12.91 to
+            # 4.28 fps at a 5 fps gate — but it does NOT speed up consumption, and measured
+            # it did not move the consumed rate at all (13.7 fps either way).
+            #
+            # It is therefore NOT what keeps this reader from falling behind. What does is
+            # that the source is LOCAL: mediamtx runs on this same machine (the devcontainer
+            # is on host networking), so this hop never crosses the robot link, and a bare
+            # decode of 720p H.264 here drains a backlog several times faster than real time.
+            # Measured 2026-09-14 with tests/reader_bench.py, 180 s against the live stream:
+            # drift +0.0 ms/s, and a deliberately injected 12 s stall recovered in under 2 s.
+            # The watchdog below is there to notice the day that stops being true.
+            t0 = pts0 = None
             while not self._stop.is_set():
-                ok, bgr = cap.read()
-                if not ok:
+                if not cap.grab():
                     raise OSError("stream ended")
-                # DECODE every frame, FORWARD only the ones the rate gate allows. Skipping
-                # the read to save work would back the decoder up instead, and the backlog
-                # would come out later as stale frames.
+                # POS_MSEC is 0/garbage until the first frame is fully decoded, and a
+                # non-advancing timestamp would fake a perfect 1:1 climb, so wait for a
+                # positive one before anchoring.
+                pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if pts_ms > 0:
+                    now = time.monotonic()
+                    if t0 is None:
+                        t0, pts0 = now, pts_ms
+                    else:
+                        self._track_lag(now - t0, (pts_ms - pts0) / 1000.0)
                 if not self._due():
+                    continue                      # drained, not decoded, not encoded
+                ok, bgr = cap.retrieve()
+                if not ok:
                     continue
                 self._on_frame(_reprocess(bgr=bgr, resolution=self._res,
                                           quality=self._quality))
