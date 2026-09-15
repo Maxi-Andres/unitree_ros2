@@ -349,43 +349,6 @@ class HttpStreamSource(_ParamSource):
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 15.0)
 
-    def _track_lag(self, elapsed_s, stream_s):
-        """How far behind the stream this reader has fallen, without any clock agreement.
-
-        A *pull* reader slower than its source does not settle at a lower frame rate: the
-        backlog upstream grows without bound and the latency climbs forever. That failure is
-        invisible for the first seconds and obvious only after minutes, which is exactly how
-        it shipped once and took the drive view to ~8 s.
-
-        The measure needs no synchronised clock, only two elapsed times compared:
-
-            lag = (our monotonic seconds since the first frame)
-                - (the stream's own presentation seconds over the same frames)
-
-        Both start at the same frame, so the unknown offset between the two clocks cancels
-        and only their RATES are compared. Keeping up holds this at ~0; falling behind grows
-        it by exactly the latency being accumulated. Absolute glass-to-glass is a different
-        question and this does not answer it — this answers "am I the one adding to it".
-        """
-        self._lag = elapsed_s - stream_s
-        self._lag_peak = max(self._lag_peak, self._lag)
-        if self._lag < self._LAG_WARN_S or not self._log:
-            return
-        now = time.monotonic()
-        if now - self._last_lag_warn < self._LAG_WARN_EVERY_S:
-            return
-        self._last_lag_warn = now
-        self._log.warn(
-            f"[camera] rtsp reader is {self._lag:.1f}s behind its source and cannot catch up "
-            f"on its own (peak {self._lag_peak:.1f}s). Frames are queueing upstream, not "
-            f"being dropped, so this latency is permanent until the stream is reopened.")
-
-    def get_params(self):
-        # Surfaced through the bridge's /status so the lag is visible WITHOUT reading logs —
-        # this is the number that decides whether the drive view can be trusted.
-        return {**super().get_params(),
-                "lag_s": round(self._lag, 2), "lag_peak_s": round(self._lag_peak, 2)}
-
     def _read_stream(self):
         # Scan for JPEG SOI/EOI markers rather than parsing multipart boundaries: it is
         # boundary-name agnostic, so the same code handles Frigate, mediamtx and any
