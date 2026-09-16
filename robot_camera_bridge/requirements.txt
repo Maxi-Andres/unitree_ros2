@@ -1,0 +1,12 @@
+# Python dependencies of the camera bridge, beyond what the devcontainer image ships.
+#
+# The image already has opencv (cv2), numpy and PyAV; these two are pip-installed on top,
+# which is why run_camera_bridge.sh checks for them instead of assuming.
+#
+# websocket-client  the producer socket to the AI-VL backend.
+# aiortc            the WHEP/WebRTC reader. Needed ONLY when STREAM_URL points at a /whep
+#                   endpoint — which is the recommended setting, because reading the same
+#                   stream over RTSP costs 2455 ms of fixed delay (see camera_sources.py).
+#                   It pulls in PyAV for the H.264 decode.
+websocket-client>=1.0
+aiortc>=1.9

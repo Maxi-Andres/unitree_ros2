@@ -22,6 +22,21 @@ backend en `wss://localhost:8443`.
   G1 publique su cámara, ponés el topic y listo (mismo bridge).
 - **`test`** — frame sintético en movimiento: **verifica todo el pipeline sin robot**.
 
+- **`stream`** — el video que **ya salió del robot**, sin DDS y sin importar en qué red
+  está. `STREAM_URL` elige el lector, y la elección está medida (ver `.env.example`):
+  **`https://127.0.0.1:8889/robot/whep` es la buena** — el H.264 de mediamtx por WebRTC,
+  ~200 ms, y no le cuesta nada al robot. `rtsp://` es el mismo stream 2455 ms tarde;
+  `http://<robot>:8093/stream` es una segunda copia de la imagen cruzando el enlace de campo.
+
+  > This bullet is the one thing in this file kept in English on purpose, because it is the
+  > setting that has been wrong twice: **the drive view, YOLO and the VLM all read whatever
+  > `STREAM_URL` points at.** WHEP needs `aiortc` in the container (`requirements.txt`;
+  > `run_camera_bridge.sh` installs it if missing) and mediamtx serving over **HTTPS** — its
+  > `webrtcEncryption: yes` makes a plain `http://` POST answer `400 Bad Request` with no
+  > explanation. TLS verification stays ON for remote hosts (pin the CA with
+  > `STREAM_TLS_CA`); it is skipped only for loopback, where there is no network to
+  > intercept.
+
 ## Cómo se usa
 1. `cp robot_camera_bridge/.env.example robot_camera_bridge/.env` y ajustá (`CAMERA_ROBOT`, etc.).
 2. En el devcontainer:

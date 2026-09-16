@@ -18,9 +18,14 @@ Sources:
 All sources share fps/resolution/quality params (set at build, live-tunable via the
 bridge's /config), and a close() so the bridge can switch source robot at runtime.
 """
+import asyncio
+import ipaddress
 import os
+import ssl
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 import cv2
@@ -48,6 +53,64 @@ def _image_msg_to_bgr(msg):
     if enc == "mono8":
         return cv2.cvtColor(buf.reshape(h, w), cv2.COLOR_GRAY2BGR)
     return buf.reshape(h, w, 3)  # best-effort fallback
+
+
+def _is_whep_url(url):
+    """A WHEP endpoint is an HTTP(S) URL whose path ends in /whep — that is how the spec
+    addresses it and how mediamtx publishes it (`https://host:8889/<path>/whep`).
+
+    Matched on the path and not on a scheme of our own invention, so the URL in .env is the
+    one the browser and `curl` take too. The MJPEG reader is the fallback for every other
+    http(s) URL, and being wrong here is not subtle: the MJPEG parser would scan an SDP
+    document for JPEG markers forever.
+    """
+    if not url.startswith(("http://", "https://")):
+        return False
+    return urllib.parse.urlsplit(url).path.rstrip("/").endswith("/whep")
+
+
+def _tls_policy(url, ca_file):
+    """How to verify the WHEP endpoint: "plain" | "verify" | "pin" | "loopback-insecure".
+
+    VERIFICATION IS THE DEFAULT, and the only way out of it is narrow and deliberate.
+    mediamtx serves WHEP over HTTPS (`webrtcEncryption: yes`) with the self-signed
+    `auto.crt` it generates for itself, which no store can verify. The standard's answer to
+    a self-signed lab certificate is to PIN A CA, not to switch verification off — that is
+    `ca_file` (STREAM_TLS_CA), and it is what a mediamtx on another machine must use; note
+    it wins even on loopback, so pinning is never silently ignored.
+
+    The single exception is a LOOPBACK host with no CA pinned: there is no network between
+    us and the server, so there is nothing for a certificate to protect against. Every other
+    host is verified, which is what makes a wrong hostname fail loudly instead of quietly
+    accepting whatever answers.
+
+    Split out from the context it builds so it can be tested without a certificate on disk.
+    """
+    if not url.startswith("https://"):
+        return "plain"
+    if ca_file:
+        return "pin"
+    if _is_loopback(urllib.parse.urlsplit(url).hostname):
+        return "loopback-insecure"
+    return "verify"
+
+
+def _is_loopback(host):
+    """Is `host` this same machine, with no network in between?
+
+    Decides whether a self-signed certificate is acceptable (see
+    `WhepStreamSource._tls_context`), so it must not be fooled by a name: only the literal
+    loopback addresses and `localhost` count. Anything it cannot parse is treated as remote,
+    which is the safe direction.
+    """
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _reprocess(jpeg=None, bgr=None, resolution="native", quality=0):
@@ -442,7 +505,74 @@ class TestPatternSource(_ParamSource):
             pass
 
 
-class RtspStreamSource(_ParamSource):
+class _LagWatchdog:
+    """Is THIS reader the one adding latency? Shared by both H.264 sources.
+
+    A *pull* reader slower than its source does not settle at a lower frame rate: the
+    backlog upstream grows without bound and the latency climbs forever. That failure is
+    invisible for the first seconds and obvious only after minutes, which is exactly how it
+    shipped once and took the drive view to ~8 s.
+
+    The measure needs no synchronised clock, only two elapsed times compared:
+
+        lag = (our monotonic seconds since the first frame)
+            - (the stream's own presentation seconds over the same frames)
+
+    Both start at the same frame, so the unknown offset between the two clocks cancels and
+    only their RATES are compared. Keeping up holds this at ~0; falling behind grows it by
+    exactly the latency being accumulated. Absolute glass-to-glass is a different question
+    and this does not answer it — this answers "am I the one adding to it".
+
+    Lives here rather than in either source because both readers decode a stream they pull
+    (RTSP through OpenCV, WHEP through aiortc) and the question is identical for both; at
+    the second copy, factor it.
+    """
+
+    # Lag past which the reader is told it is losing the race. One second is already far
+    # more than the whole rest of the path costs, so anything over it is a defect and not
+    # jitter; the log is throttled to this many seconds so a bad night is not a log flood.
+    _LAG_WARN_S = 1.0
+    _LAG_WARN_EVERY_S = 30.0
+    # Named in the warning, so a log line says WHICH reader fell behind when both exist.
+    _LAG_LABEL = "reader"
+
+    def _init_lag(self):
+        self._lag = 0.0          # seconds this reader is behind the stream's own timebase
+        self._lag_peak = 0.0     # worst since the process started, for after-the-fact triage
+        self._last_lag_warn = 0.0
+
+    def _reset_lag(self):
+        """A reconnect starts a new stream with a new timebase, so the lag measured against
+        the old one means nothing. The PEAK is deliberately NOT reset: it is the only record
+        that the last stream went bad, and clearing it on reconnect would hide exactly the
+        failure this is here to catch."""
+        self._lag = 0.0
+        self._last_lag_warn = 0.0
+
+    def _track_lag(self, elapsed_s, stream_s):
+        """Fold one frame into the measure above and warn, throttled, once it is a defect."""
+        self._lag = elapsed_s - stream_s
+        self._lag_peak = max(self._lag_peak, self._lag)
+        if self._lag < self._LAG_WARN_S or not self._log:
+            return
+        now = time.monotonic()
+        if now - self._last_lag_warn < self._LAG_WARN_EVERY_S:
+            return
+        self._last_lag_warn = now
+        self._log.warn(
+            f"[camera] {self._LAG_LABEL} is {self._lag:.1f}s behind its source and cannot "
+            f"catch up on its own (peak {self._lag_peak:.1f}s). Frames are queueing "
+            f"upstream, not being dropped, so this latency is permanent until the stream "
+            f"is reopened.")
+
+    def get_params(self):
+        # Surfaced through the bridge's /status so the lag is visible WITHOUT reading logs —
+        # this is the number that decides whether the drive view can be trusted.
+        return {**super().get_params(),
+                "lag_s": round(self._lag, 2), "lag_peak_s": round(self._lag_peak, 2)}
+
+
+class RtspStreamSource(_LagWatchdog, _ParamSource):
     """Read the robot's H.264 from mediamtx, so the robot sends ONE stream and not two.
 
     WHY THIS EXISTS. The robot already encodes H.264 in hardware and pushes it to mediamtx.
@@ -461,6 +591,15 @@ class RtspStreamSource(_ParamSource):
     pass-through and every frame is decoded and re-encoded to JPEG for the backend. That
     costs a few ms per frame on a workstation, and it happens at HQ rather than on the
     robot's Jetson, which is the machine that has no headroom.
+
+    ⚠️ DO NOT POINT THE DRIVE VIEW AT THIS. Reading mediamtx with OpenCV costs 2455 ms of
+    FIXED delay — measured 2026-09-15 two independent ways, constant from the first frame,
+    not accumulating, and unmoved by every FFmpeg option tried (probesize, analyzeduration,
+    max_delay, reorder_queue_size, threads, TCP vs UDP) or by mediamtx's writeQueueSize. It
+    is the CLIENT, not the stream: three consumers of the same path at the same time gave
+    WebRTC/WHEP 200 ms, Frigate's own ffmpeg 1475 ms, this reader 2455 ms. Root cause still
+    unknown. `WhepStreamSource` below is the reader for anything a human steers by; this one
+    stays for recording-shaped consumers and as the fallback when aiortc is not installed.
     """
 
     # Matches HttpStreamSource: a stream that ran this long was working, so whatever ended
@@ -471,11 +610,7 @@ class RtspStreamSource(_ParamSource):
     # for a view someone steers by; stimeout so a dead link raises instead of blocking the
     # reader thread forever.
     _FFMPEG_OPTS = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;5000000"
-    # Lag past which the reader is told it is losing the race. One second is already far
-    # more than the whole rest of the path costs, so anything over it is a defect and not
-    # jitter; the log is throttled to this many seconds so a bad night is not a log flood.
-    _LAG_WARN_S = 1.0
-    _LAG_WARN_EVERY_S = 30.0
+    _LAG_LABEL = "rtsp reader"
 
     def __init__(self, node, on_frame, url, fps=15, resolution="native", quality=0,
                  logger=None):
@@ -487,9 +622,7 @@ class RtspStreamSource(_ParamSource):
         self._url = url
         self._log = logger
         self._stop = threading.Event()
-        self._lag = 0.0          # seconds this reader is behind the stream's own timebase
-        self._lag_peak = 0.0     # worst since the process started, for after-the-fact triage
-        self._last_lag_warn = 0.0
+        self._init_lag()
         self._thread = threading.Thread(target=self._run, name="rtsp-stream", daemon=True)
         self._thread.start()
         if logger:
@@ -499,12 +632,7 @@ class RtspStreamSource(_ParamSource):
         backoff = 1.0
         while not self._stop.is_set():
             started = time.monotonic()
-            # A reconnect starts a new stream with a new timebase, so the lag measured
-            # against the old one means nothing. The PEAK is deliberately not reset: it is
-            # the only record that the last stream went bad, and clearing it on reconnect
-            # would hide exactly the failure this is here to catch.
-            self._lag = 0.0
-            self._last_lag_warn = 0.0
+            self._reset_lag()
             try:
                 self._read_stream()
             except Exception as exc:
@@ -515,43 +643,6 @@ class RtspStreamSource(_ParamSource):
                                    f"retry in {backoff:.0f}s")
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 15.0)
-
-    def _track_lag(self, elapsed_s, stream_s):
-        """How far behind the stream this reader has fallen, without any clock agreement.
-
-        A *pull* reader slower than its source does not settle at a lower frame rate: the
-        backlog upstream grows without bound and the latency climbs forever. That failure is
-        invisible for the first seconds and obvious only after minutes, which is exactly how
-        it shipped once and took the drive view to ~8 s.
-
-        The measure needs no synchronised clock, only two elapsed times compared:
-
-            lag = (our monotonic seconds since the first frame)
-                - (the stream's own presentation seconds over the same frames)
-
-        Both start at the same frame, so the unknown offset between the two clocks cancels
-        and only their RATES are compared. Keeping up holds this at ~0; falling behind grows
-        it by exactly the latency being accumulated. Absolute glass-to-glass is a different
-        question and this does not answer it — this answers "am I the one adding to it".
-        """
-        self._lag = elapsed_s - stream_s
-        self._lag_peak = max(self._lag_peak, self._lag)
-        if self._lag < self._LAG_WARN_S or not self._log:
-            return
-        now = time.monotonic()
-        if now - self._last_lag_warn < self._LAG_WARN_EVERY_S:
-            return
-        self._last_lag_warn = now
-        self._log.warn(
-            f"[camera] rtsp reader is {self._lag:.1f}s behind its source and cannot catch up "
-            f"on its own (peak {self._lag_peak:.1f}s). Frames are queueing upstream, not "
-            f"being dropped, so this latency is permanent until the stream is reopened.")
-
-    def get_params(self):
-        # Surfaced through the bridge's /status so the lag is visible WITHOUT reading logs —
-        # this is the number that decides whether the drive view can be trusted.
-        return {**super().get_params(),
-                "lag_s": round(self._lag, 2), "lag_peak_s": round(self._lag_peak, 2)}
 
     def _read_stream(self):
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._FFMPEG_OPTS
@@ -606,6 +697,241 @@ class RtspStreamSource(_ParamSource):
         self._stop.set()
 
 
+class WhepStreamSource(_LagWatchdog, _ParamSource):
+    """Read the robot's H.264 from mediamtx over WebRTC/WHEP — the only client of that
+    stream that is measured in milliseconds.
+
+    WHY THIS EXISTS, and it is worth stating plainly because it undoes a decision made twice.
+    The drive view, YOLO and the VLM all eat from this bridge, and the bridge read the
+    robot's own MJPEG over HTTP — a SECOND copy of the same picture, over TCP, across the
+    field link. Measured over LTE on 2026-09-16:
+
+        H.264 over SRT   11.0 -> 14.2 fps      the transport that discards and moves on
+        MJPEG over TCP    4.5 fps              one lost packet blocks everything behind it
+
+    So detection ran at a third of the frame rate of the picture the operator was watching,
+    and it cost 0.170 Mbps of a ~0.93 Mbps uplink (measured on the socket, same day) to do
+    it. Reading the H.264 that already arrived costs the robot NOTHING: mediamtx is on this
+    machine and fans it out over loopback.
+
+    WHY NOT RTSP, which is the same stream from the same server: 2455 ms of fixed delay, see
+    the warning on `RtspStreamSource`. WHEP is the path the browser already uses at ~200 ms,
+    and using it here makes the bridge see exactly what the operator sees.
+
+    WHAT IT COSTS. H.264 in, JPEG out, so every frame is decoded (aiortc/PyAV) and
+    re-encoded. That is real CPU — but it is spent on the workstation, which has headroom,
+    instead of on the robot's Jetson, which does not.
+
+    THE PICTURE IS 1080p HERE. The MJPEG branch was pre-shrunk on the robot (MJPEG_WIDTH)
+    because it crossed the link; this one does not cross anything, so set STREAM_RESOLUTION
+    for what the consumers want rather than for what the uplink survives.
+    """
+
+    # Matches the other sources: a stream that ran this long was working, so whatever ended
+    # it was a blip and the next reconnect starts from the short delay.
+    _HEALTHY_S = 5.0
+    _LAG_LABEL = "whep reader"
+    # WebRTC has no connection to break: a dead uplink just stops delivering frames, with no
+    # error anywhere. Without a deadline the reader would wait forever and the drive view
+    # would sit frozen on its last picture. 5 s is ~70 frames at the robot's ~14 fps, so it
+    # cannot fire on jitter.
+    _RECV_TIMEOUT_S = 5.0
+    # How often that wait wakes up. It is also what bounds close(): a source switch must not
+    # sit behind a five-second read, and frames from a closed source must not reach the
+    # backend after the new one starts.
+    _STOP_POLL_S = 1.0
+    # The SDP exchange is two small HTTP requests on loopback; anything slower is broken.
+    _SIGNALING_TIMEOUT_S = 10.0
+    # An SDP answer is a few kB. Bound the read so a misconfigured URL pointing at something
+    # that is not a WHEP endpoint (an HTML error page, a file server) cannot be read into
+    # memory unbounded.
+    _MAX_SDP_BYTES = 256 * 1024
+    # A missing dependency does not fix itself, so back off far further than a network blip.
+    _MISSING_DEP_RETRY_S = 60.0
+
+    def __init__(self, node, on_frame, url, fps=15, resolution="native", quality=0,
+                 logger=None, ca_file=None):
+        # quality 0 means "forward the source JPEG untouched" everywhere else; here there is
+        # no source JPEG, so it would mean "encode at the _reprocess default". Pin it to
+        # something explicit instead of inheriting that surprise.
+        super().__init__(fps, resolution, quality or 75)
+        self._on_frame = on_frame
+        self._url = url
+        self._ca_file = ca_file or None
+        self._log = logger
+        self._stop = threading.Event()
+        self._init_lag()
+        self._thread = threading.Thread(target=self._run, name="whep-stream", daemon=True)
+        self._thread.start()
+        if logger:
+            logger.info(f"[camera] WHEP/H.264 source: {url}")
+
+    def _run(self):
+        backoff = 1.0
+        while not self._stop.is_set():
+            started = time.monotonic()
+            self._reset_lag()
+            try:
+                asyncio.run(self._session())
+            except ImportError as exc:
+                # Retrying in a second cannot install a package, and at the short backoff
+                # this would print the same line every second for as long as the bridge
+                # runs. Say what to do, then wait long enough to be readable.
+                if self._log and not self._stop.is_set():
+                    self._log.warn(f"[camera] the WHEP source needs aiortc ({exc}); "
+                                   f"pip3 install -r robot_camera_bridge/requirements.txt, "
+                                   f"or point STREAM_URL at an MJPEG or RTSP source")
+                self._stop.wait(self._MISSING_DEP_RETRY_S)
+            except Exception as exc:
+                if time.monotonic() - started >= self._HEALTHY_S:
+                    backoff = 1.0
+                if self._log and not self._stop.is_set():
+                    self._log.warn(f"[camera] whep {self._url} failed: {exc}; "
+                                   f"retry in {backoff:.0f}s")
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, 15.0)
+
+    async def _session(self):
+        # Imported HERE and not at module level on purpose. The test suite and CI run with
+        # only ruff and pytest installed (see tests/conftest.py), and a module-level aiortc
+        # would make every source in this file unimportable there — including the ones that
+        # have nothing to do with WebRTC. It also keeps the dependency optional for a
+        # deployment that never selects this source.
+        from aiortc import RTCPeerConnection, RTCSessionDescription
+
+        pc = RTCPeerConnection()
+        tracks = asyncio.Queue()
+        resource = None
+
+        @pc.on("track")
+        def _on_track(track):
+            tracks.put_nowait(track)
+
+        try:
+            # recvonly, and video only: we are a viewer, and the robot publishes no audio.
+            pc.addTransceiver("video", direction="recvonly")
+            await pc.setLocalDescription(await pc.createOffer())
+            # Non-trickle: setLocalDescription has already gathered the candidates, so the
+            # offer we post is complete and there is no second signalling channel to keep
+            # open. urllib blocks, so it runs off the event loop.
+            answer, resource = await asyncio.get_running_loop().run_in_executor(
+                None, self._exchange_sdp, pc.localDescription.sdp)
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=answer, type="answer"))
+            track = await asyncio.wait_for(tracks.get(), self._SIGNALING_TIMEOUT_S)
+            await self._pump(track)
+        except asyncio.TimeoutError as exc:
+            raise OSError("the server answered but sent no video track") from exc
+        finally:
+            await pc.close()
+            self._release(resource)
+
+    def _exchange_sdp(self, offer):
+        """POST the offer, return (answer SDP, resource URL) — WHEP's whole handshake.
+
+        Checked rather than trusted, because the failure this catches is silent: a URL that
+        is not a WHEP endpoint answers 200 with HTML, which `setRemoteDescription` would
+        then reject with a parser error that says nothing about the real mistake.
+        """
+        req = urllib.request.Request(
+            self._url, data=offer.encode(), method="POST",
+            headers={"Content-Type": "application/sdp", "User-Agent": "ai-vl-bridge"})
+        with urllib.request.urlopen(req, timeout=self._SIGNALING_TIMEOUT_S,
+                                    context=self._tls_context()) as resp:
+            if resp.status != 201:
+                raise OSError(f"WHEP endpoint answered {resp.status}, expected 201 Created")
+            body = resp.read(self._MAX_SDP_BYTES + 1)
+            if len(body) > self._MAX_SDP_BYTES:
+                raise OSError(f"WHEP answer exceeds {self._MAX_SDP_BYTES} bytes; "
+                              f"this is not an SDP document")
+            sdp = body.decode("utf-8", "replace")
+            if not sdp.startswith("v="):
+                raise OSError(f"WHEP answer is not SDP (starts with {sdp[:20]!r})")
+            return sdp, resp.headers.get("Location")
+
+    def _release(self, resource):
+        """DELETE the session resource — WHEP's teardown, and not optional here.
+
+        Without it mediamtx keeps the reader until ICE times out, so a reconnect loop stacks
+        sessions on top of each other and every one of them is still being sent video over
+        loopback. Best-effort: a teardown that fails must never stop the reconnect.
+        """
+        if not resource:
+            return
+        req = urllib.request.Request(urllib.parse.urljoin(self._url, resource),
+                                     method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=self._SIGNALING_TIMEOUT_S,
+                                        context=self._tls_context()):
+                pass
+        except (urllib.error.URLError, OSError) as exc:
+            if self._log:
+                self._log.warn(f"[camera] whep session not released: {exc}")
+
+    def _tls_context(self):
+        """Turn `_tls_policy` into the context urlopen wants (None = its own default)."""
+        policy = _tls_policy(self._url, self._ca_file)
+        if policy == "plain" or policy == "verify":
+            return None                      # http, or https with default verification
+        if policy == "pin":
+            return ssl.create_default_context(cafile=self._ca_file)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    async def _pump(self, track):
+        """Decode every frame, forward the ones the rate gate lets through.
+
+        EVERY frame is received, always — the gate drops AFTER the decode, never before.
+        aiortc hands frames over an unbounded queue, so a reader that skipped receiving
+        would not slow down, it would fall behind forever; that is the failure `_track_lag`
+        watches for. What the gate saves is the colour conversion and the JPEG encode, which
+        is the expensive half.
+        """
+        t0 = pts0 = None
+        while not self._stop.is_set():
+            frame = await self._recv(track)
+            if frame is None:
+                return                       # a stop was asked for, not a failure
+            now = time.monotonic()
+            if frame.pts is not None and frame.time_base:
+                stream_s = float(frame.pts * frame.time_base)
+                if t0 is None:
+                    t0, pts0 = now, stream_s
+                else:
+                    self._track_lag(now - t0, stream_s - pts0)
+            if not self._due():
+                continue
+            jpg = _reprocess(bgr=frame.to_ndarray(format="bgr24"),
+                             resolution=self._res, quality=self._quality)
+            # Checked again after the encode: close() can land while a frame is in flight,
+            # and a switched-away source must not push pictures into the new source's view.
+            if jpg and not self._stop.is_set():
+                self._on_frame(jpg)
+
+    async def _recv(self, track):
+        """One frame, or None if a stop was requested. Raises once the stream is dead.
+
+        Waits in short slices instead of one long one so that close() takes effect in
+        `_STOP_POLL_S` rather than in `_RECV_TIMEOUT_S`, while a genuinely dead stream still
+        raises after the full deadline.
+        """
+        waited = 0.0
+        while not self._stop.is_set():
+            try:
+                return await asyncio.wait_for(track.recv(), self._STOP_POLL_S)
+            except asyncio.TimeoutError:
+                waited += self._STOP_POLL_S
+                if waited >= self._RECV_TIMEOUT_S:
+                    raise OSError(f"no frame for {self._RECV_TIMEOUT_S:.0f}s; "
+                                  f"the stream is gone") from None
+        return None
+
+    def close(self):
+        self._stop.set()
+
+
+
 def build_source(robot, node, on_frame, cfg, logger=None):
     """Factory: pick the CameraSource for `robot` using cfg (env-derived)."""
     if robot == "go2":
@@ -636,18 +962,31 @@ def build_source(robot, node, on_frame, cfg, logger=None):
             resolution=cfg.get("G1_RESOLUTION", "native"),
             quality=0, logger=logger)
     if robot == "stream":
-        # No robot subnet required: reads the video that already left the robot. The URL's
-        # SCHEME picks the reader, so pointing STREAM_URL at mediamtx's RTSP is all it takes
-        # to stop pulling a second copy off the robot — no new mode to remember, and the
-        # existing go2|g1|stream|test switch keeps working untouched.
+        # No robot subnet required: reads the video that already left the robot. The URL
+        # picks the reader, so moving between transports is one line in .env — no new mode
+        # to remember, and the existing go2|g1|stream|test switch keeps working untouched.
+        #
+        # WHICH URL TO USE, measured and not a matter of taste:
+        #   .../whep  -> WebRTC, ~200 ms. The drive view, YOLO and the VLM all read this.
+        #   rtsp://   -> the same stream from the same server, 2455 ms FIXED. Recording only.
+        #   http://   -> MJPEG. Costs the robot a second copy of the picture over the field
+        #               link; it is what WHEP replaced. Kept for Frigate and for the robot's
+        #               own :8093 when there is no mediamtx.
         url = cfg.get("STREAM_URL", "http://127.0.0.1:5000/api/robot")
-        source = RtspStreamSource if url.startswith(("rtsp://", "rtsps://")) else HttpStreamSource
+        kwargs = {}
+        if url.startswith(("rtsp://", "rtsps://")):
+            source = RtspStreamSource
+        elif _is_whep_url(url):
+            source = WhepStreamSource
+            kwargs["ca_file"] = cfg.get("STREAM_TLS_CA", "")
+        else:
+            source = HttpStreamSource
         return source(
             node, on_frame,
             url=url,
             fps=float(cfg.get("STREAM_FPS", 15)),
             resolution=cfg.get("STREAM_RESOLUTION", "native"),
-            quality=int(cfg.get("STREAM_QUALITY", 0) or 0), logger=logger)
+            quality=int(cfg.get("STREAM_QUALITY", 0) or 0), logger=logger, **kwargs)
     if robot == "test":
         return TestPatternSource(
             node, on_frame, fps=float(cfg.get("TEST_FPS", 15)),

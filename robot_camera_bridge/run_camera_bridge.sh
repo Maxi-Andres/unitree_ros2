@@ -12,6 +12,17 @@ if [ ! -f "$HERE/.env" ]; then
   echo "[camera] created .env from .env.example"
 fi
 
+# The WHEP reader's dependency is pip-installed, NOT part of the devcontainer image, so it
+# disappears every time the image is rebuilt — and the failure is quiet: the bridge starts,
+# the source retries in a loop and the drive view stays dark. Check it here, where it can be
+# said out loud, and only install when it is actually missing (a field start must not wait
+# on a package index it cannot reach).
+if ! python3 -c "import aiortc" >/dev/null 2>&1; then
+  echo "[camera] aiortc missing (the WHEP/H.264 reader); installing from requirements.txt …"
+  pip3 install --quiet --timeout 20 --retries 1 -r "$HERE/requirements.txt" \
+    || echo "[camera] could not install aiortc; STREAM_URL must not be a /whep endpoint" >&2
+fi
+
 # shellcheck source=/dev/null
 source "$WS/setup.sh"
 echo "[camera] ROS2 env sourced; starting robot_camera_bridge.py …"
