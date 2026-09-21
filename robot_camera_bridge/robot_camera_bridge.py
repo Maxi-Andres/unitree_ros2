@@ -30,6 +30,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import camera_sources
+import h264_relay
 import rclpy
 import websocket  # websocket-client
 
@@ -77,6 +78,13 @@ ROBOT = os.environ.get("CAMERA_ROBOT", "go2")           # go2 | g1 | stream | te
 # "stream" needs no DDS: it reads the video that already left the robot (see
 # camera_sources.HttpStreamSource). Use it whenever the robot is not on this subnet.
 BACKEND_WS_URL = os.environ.get("BACKEND_WS_URL", "wss://localhost:8443/ws/robot-cam")
+# The DRIVE branch, relayed straight through. Empty = off, which is the default: it needs
+# `H264_ENABLE=1` on the robot and a browser that decodes with WebCodecs. Separate from
+# everything above on purpose — these bytes are H.264 and nothing here decodes them, while the
+# JPEG path feeds YOLO and the VLM, which do. See h264_relay.py.
+H264_URL = os.environ.get("H264_URL", "")
+H264_WS_URL = os.environ.get("H264_WS_URL", "wss://localhost:8443/ws/robot-h264")
+
 CONTROL_HOST = os.environ.get("CAMERA_CONTROL_HOST", "0.0.0.0")  # noqa: S104  # known finding P0-1: binds broadly, no auth yet
 CONTROL_PORT = int(os.environ.get("CAMERA_CONTROL_PORT", "8091"))
 START_STREAMING = _as_bool(os.environ.get("START_STREAMING"), False)
@@ -316,6 +324,12 @@ def main():
             rclpy.shutdown()
         return 3
     threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # Independent of the JPEG path and of the streaming flag: it carries no detections and
+    # nothing downstream of it can stall this process. If the robot is not serving /h264 it
+    # simply retries with backoff and says so once per attempt.
+    if H264_URL:
+        h264_relay.H264Relay(H264_URL, H264_WS_URL, logger=node.get_logger())
 
     resumed = os.path.exists(_STREAMING_FLAG)
     if START_STREAMING or resumed:

@@ -43,6 +43,12 @@ for _name in ("cv2", "numpy"):
     if _name not in sys.modules:
         sys.modules[_name] = _stub(_name)
 
+# `websocket` (websocket-client) is what h264_relay talks to the backend with. Stubbed for the
+# same reason as the others: the parser under test never opens a socket, and CI installs only
+# ruff and pytest.
+if "websocket" not in sys.modules:
+    sys.modules["websocket"] = _stub("websocket")
+
 if "rclpy" not in sys.modules:
     _rclpy = _stub("rclpy")
     _qos = _stub("rclpy.qos")
