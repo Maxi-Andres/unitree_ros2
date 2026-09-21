@@ -145,6 +145,26 @@ class H264Relay:
             # had not been restarted yet, reported as "relay http://<robot>/h264 failed".
             raise OSError(f"backend {self._backend}: {exc}") from exc
         self._ws.settimeout(None)
+        # DRAIN THE SOCKET, or the server hangs up on us.
+        #
+        # This relay only ever PUSHES, but uvicorn sends keepalive PINGs and websocket-client
+        # answers PONG only while something is blocked in recv(). Without this thread the
+        # pings go unanswered and the connection is closed from the far end after ~20 s; the
+        # next send then fails with "socket is already closed" and the relay reconnects in a
+        # loop that looks like a network problem and is not. MEASURED 2026-09-21, and the JPEG
+        # producer in robot_camera_bridge.py documents the very same trap — it was there to be
+        # copied and was not.
+        ws = self._ws
+        threading.Thread(target=self._drain, args=(ws,), daemon=True).start()
+
+    def _drain(self, ws):
+        """Answer the server's keepalive pings by staying in recv(). Exits when the socket
+        closes or is replaced; the send path notices and reconnects."""
+        try:
+            while True:
+                ws.recv()
+        except Exception:
+            pass
 
     def _close(self):
         if self._ws is not None:
