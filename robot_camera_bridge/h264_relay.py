@@ -17,6 +17,7 @@ and its capture time cannot be paired wrongly under load.
 """
 from __future__ import annotations
 
+import select
 import ssl
 import struct
 import threading
@@ -188,6 +189,23 @@ class H264Relay:
                 if not chunk:
                     raise OSError("stream closed by peer")
                 frames = reader.feed(chunk)
+                # DRAIN TO THE NEWEST BEFORE SENDING ANYTHING.
+                #
+                # Reading one frame per pass and forwarding it is how a backlog becomes
+                # permanent: the source produces at 14 fps and this loop consumes at 14 fps,
+                # so whatever gap opens once is carried for ever. MEASURED 2026-09-21 — a
+                # burst from an encoder rebuild left this path 288 ms behind (four frames) and
+                # it was STILL 288 ms behind forty seconds later, delivering at a perfect
+                # 72 ms cadence the whole time. A steady cadence is not proof of freshness.
+                #
+                # So empty the socket first and keep only the last frame in it. Anything
+                # older is already worthless to someone steering, and this is the same
+                # discipline `Latest` on the robot and `_put_latest` in the backend apply.
+                while select.select([resp.fileno()], [], [], 0)[0]:
+                    more = resp.read1(65536)
+                    if not more:
+                        raise OSError("stream closed by peer")
+                    frames.extend(reader.feed(more))
                 if not frames:
                     continue
                 # Forward only the NEWEST of a batch. If several arrived while this thread was
