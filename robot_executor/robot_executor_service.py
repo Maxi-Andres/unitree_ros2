@@ -43,15 +43,20 @@ Endpoints:
                                  persist=true also writes the robot's video.env. Proxied to
                                  the on-robot relay, which owns the allowlist and ranges.
 """
+import hashlib
+import hmac
 import json
 import os
 import queue
 import re
 import signal
+import socket
+import struct
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -920,6 +925,94 @@ class G1Ros2Transport(RobotTransport):
                 self._pubs = {}
 
 
+class _RelayUdp:
+    """The UDP half of RelayTransport: `move` and `stop_move` datagrams, and their acks.
+
+    SECOND COPY OF THE WIRE FORMAT, ON PURPOSE: the receiver is `relay_server.UdpControl`
+    in robot-command-relay, which documents the format, the HMAC and the ordering rule.
+    Both test suites assert the same golden bytes; change one side, change the other.
+
+    Never blocks the caller: a send that cannot go out right now is a lost datagram, which
+    is exactly what the next refresh 100 ms later is for.
+    """
+
+    CMD = struct.Struct("<2sBBdfff")
+    ACK = struct.Struct("<2sBBd")
+    MAC_LEN = 16
+    KIND_MOVE, KIND_STOP = 1, 2
+    # Silence this long while sending means UDP does not get through (or the link is
+    # down): the transport falls back to HTTP. Shorter than the robot's 1 s dead-man, so
+    # the fall-back happens before the robot stops on its own.
+    SILENT_S = 0.6
+
+    def __init__(self, host, port, key):
+        self._key = key
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.connect((host, port))
+        self._sock.settimeout(0.5)
+        self._last_ack = 0.0            # monotonic, 0 = never
+        self._sending_since = None      # monotonic start of the current unacked stretch
+        self.sent = 0
+        self.acked = 0
+        self.rtt_ms = None
+        threading.Thread(target=self._recv, name="relay-udp-ack", daemon=True).start()
+
+    def _mac(self, body):
+        return hmac.new(self._key, body, hashlib.sha256).digest()[:self.MAC_LEN]
+
+    def encode(self, kind, ts, vx=0.0, vy=0.0, vyaw=0.0):
+        body = self.CMD.pack(b"RC", 1, kind, ts, vx, vy, vyaw)
+        return body + self._mac(body)
+
+    def send(self, kind, ts, vx=0.0, vy=0.0, vyaw=0.0):
+        now = time.monotonic()
+        if self._sending_since is None:
+            self._sending_since = now
+        try:
+            self._sock.send(self.encode(kind, ts, vx, vy, vyaw))
+            self.sent += 1
+        except OSError:
+            pass                        # an ICMP refusal or a blinked route: a lost datagram
+
+    def silent(self, now):
+        """True when we have been sending for SILENT_S and nothing has been acknowledged."""
+        if self._sending_since is None:
+            return False
+        return now - max(self._last_ack, self._sending_since) >= self.SILENT_S
+
+    def idle(self):
+        """Stop counting silence: nothing is being sent, so none is expected back."""
+        self._sending_since = None
+
+    def _recv(self):
+        while True:
+            try:
+                data = self._sock.recv(64)
+            except TimeoutError:
+                continue
+            except OSError:
+                time.sleep(0.1)         # ICMP port unreachable from a stopped relay
+                continue
+            self.on_ack(data, time.monotonic(), time.time())
+
+    def on_ack(self, data, now, wall):
+        """Count an ack as proof that UDP gets through — only if it is authentic. Returns
+        whether it was: a forged ack must not keep the transport on a path that is down."""
+        if len(data) != self.ACK.size + self.MAC_LEN:
+            return False
+        body, mac = data[:self.ACK.size], data[self.ACK.size:]
+        if not hmac.compare_digest(mac, self._mac(body)):
+            return False
+        magic, _version, _status, ts = self.ACK.unpack(body)
+        if magic != b"RA":
+            return False
+        self._last_ack = now
+        self._sending_since = now
+        self.acked += 1
+        self.rtt_ms = round((wall - ts) * 1000.0, 1)
+        return True
+
+
 class RelayTransport(RobotTransport):
     """Command the robot over HTTP instead of publishing DDS from this machine.
 
@@ -951,10 +1044,20 @@ class RelayTransport(RobotTransport):
         "damp": "damp",
         "hello": "hello",
     }
-    # Well inside the relay's default 1500 ms dead-man window.
-    _REFRESH_S = 0.4
+    # HTTP refresh. The relay's dead-man is 1000 ms (since 2026-09-23), and over Starlink one
+    # POST alone took up to 556 ms — refresh + POST must stay under the window.
+    _REFRESH_S = 0.25
+    # UDP refresh. Nothing waits on a datagram, so this can be fast: one second of dead-man
+    # rides out nine lost in a row, and the worst run measured over Starlink was four.
+    _UDP_REFRESH_S = 0.1
+    # Copies of a stop sent over UDP, a few ms apart, BEFORE the HTTP stop. Stopping must not
+    # hinge on one packet, and loss comes in bursts, so the copies are spaced out.
+    _UDP_STOP_COPIES = 3
+    _UDP_STOP_GAP_S = 0.02
+    # After UDP was found silent, stay on HTTP this long before trying UDP again.
+    _UDP_RETRY_S = 30.0
 
-    def __init__(self, robot: str, url: str, token: str, dry_run: bool):
+    def __init__(self, robot: str, url: str, token: str, dry_run: bool, udp_port: int = 0):
         self._robot = robot
         self._url = url.rstrip("/") + "/cmd"
         self._token = token
@@ -962,9 +1065,50 @@ class RelayTransport(RobotTransport):
         self._move_lock = threading.Lock()
         self._move_stop = threading.Event()
         self._move_thread = None
-        print(f"[executor] {robot}: RELAY transport -> {self._url}", flush=True)
+        self._ts_lock = threading.Lock()
+        self._last_ts = 0.0
+        self._udp = None
+        self._udp_off_until = 0.0
+        self._udp_proven_at = None       # set when UDP is (re)enabled; see _udp_active
+        self._udp_acked_at_enable = 0
+        if udp_port and not dry_run:
+            host = urllib.parse.urlsplit(url).hostname
+            self._udp = _RelayUdp(host, udp_port, token.encode())
+        via = f"UDP :{udp_port} for move/stop, HTTP for the rest" if self._udp else "HTTP"
+        print(f"[executor] {robot}: RELAY transport -> {self._url} ({via})", flush=True)
+
+    def _next_ts(self) -> float:
+        """This machine's clock, forced strictly increasing: the relay orders every movement
+        command by it and refuses a repeat, so two commands in the same microsecond (or a
+        clock stepped back by NTP) must still come out in the order they were issued."""
+        with self._ts_lock:
+            self._last_ts = max(time.time(), self._last_ts + 1e-6)
+            return self._last_ts
+
+    def _udp_active(self) -> bool:
+        if self._udp is None or time.monotonic() < self._udp_off_until:
+            return False
+        if self._udp_proven_at is None:
+            # (Re)enabled now: remember the ack count, so "proven" means an ack AFTER this.
+            self._udp_proven_at = time.monotonic()
+            self._udp_acked_at_enable = self._udp.acked
+        return True
+
+    def _udp_stop(self):
+        """A burst of UDP stops. Best effort; the HTTP stop that follows is the guarantee."""
+        if self._udp is None:
+            return
+        for i in range(self._UDP_STOP_COPIES):
+            if i:
+                time.sleep(self._UDP_STOP_GAP_S)
+            self._udp.send(_RelayUdp.KIND_STOP, self._next_ts())
+        self._udp.idle()
 
     def _post(self, body: dict) -> dict:
+        if body.get("verb") in ("move", "stop_move"):
+            # Ordered against the UDP path on the robot: a move older than the last command
+            # or stop is refused there, so neither path can overtake the other.
+            body = {**body, "ts": self._next_ts()}
         if self._dry_run:
             print(f"[DRY_RUN] would POST {self._url} {body}", flush=True)
             return {"ok": True, "reply": "ok dry-run"}
@@ -1011,13 +1155,38 @@ class RelayTransport(RobotTransport):
         reached_deadline = False
         try:
             while not self._move_stop.is_set():
-                if deadline is not None and time.monotonic() >= deadline:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
                     reached_deadline = True
                     break
-                self._post({"verb": "move", "vx": vx, "vy": vy, "vyaw": vyaw})
-                self._move_stop.wait(self._REFRESH_S)
+                if self._udp_active():
+                    # Fire and forget: no round trip in the loop, so a lost or late datagram
+                    # delays nothing — the next one is 100 ms behind it.
+                    self._udp.send(_RelayUdp.KIND_MOVE, self._next_ts(), vx, vy, vyaw)
+                    if self._udp.silent(now):
+                        self._udp_off_until = now + self._UDP_RETRY_S
+                        self._udp_proven_at = None
+                        self._udp.idle()
+                        print(f"[executor] {self._robot}: no UDP acks for "
+                              f"{_RelayUdp.SILENT_S:.1f}s — HTTP for {self._UDP_RETRY_S:.0f}s",
+                              flush=True)
+                        continue
+                    if self._udp.acked == self._udp_acked_at_enable:
+                        # UNPROVEN: no ack yet since UDP was (re)enabled. Send over HTTP too,
+                        # or a path that is still blocked leaves the robot unrefreshed for
+                        # SILENT_S plus a POST — ~0.9 s over Starlink, against a 1 s dead-man.
+                        # Safe to duplicate: the relay orders both paths by ts and drops the
+                        # older copy.
+                        self._post({"verb": "move", "vx": vx, "vy": vy, "vyaw": vyaw})
+                    self._move_stop.wait(self._UDP_REFRESH_S)
+                else:
+                    self._post({"verb": "move", "vx": vx, "vy": vy, "vyaw": vyaw})
+                    self._move_stop.wait(self._REFRESH_S)
         finally:
+            if self._udp is not None:
+                self._udp.idle()
             if reached_deadline:
+                self._udp_stop()
                 self._post({"verb": "stop_move"})
 
     def _start_move(self, vx, vy, vyaw, duration, continuous):
@@ -1047,6 +1216,7 @@ class RelayTransport(RobotTransport):
         if kind == "stop":
             with self._move_lock:
                 self._stop_move_loop()
+            self._udp_stop()                 # fast path first; HTTP below is the guarantee
             res = self._post({"verb": "stop_move"})
             return {"ok": bool(res.get("ok")), "detail": f"StopMove via relay "
                     f"({res.get('reply')})"}
@@ -1071,6 +1241,7 @@ class RelayTransport(RobotTransport):
         with self._move_lock:
             self._stop_move_loop()
         if stop_first and not self._dry_run:
+            self._udp_stop()
             self._post({"verb": "stop_move"})
 
 
@@ -1101,6 +1272,18 @@ def _dangerous_skills(robot: str) -> set:
     return getattr(mod, "DANGEROUS_SKILLS", set()) if mod else set()
 
 
+def _relay_udp_port() -> int:
+    """RELAY_UDP_PORT, or 0 (HTTP only). Anything that is not a port in 1024-65535 is 0: a
+    typo must cost the UDP path, never the ability to command the robot."""
+    raw = os.environ.get("RELAY_UDP_PORT", "").strip()
+    if raw.isascii() and raw.isdigit() and 1024 <= int(raw) <= 65535:
+        return int(raw)
+    if raw and raw != "0":
+        print(f"[executor] RELAY_UDP_PORT={raw!r} is not a port in 1024-65535; "
+              f"relay commands stay on HTTP", flush=True)
+    return 0
+
+
 def _get_transport(robot: str) -> RobotTransport:
     with _TRANSPORTS_LOCK:
         if robot not in _TRANSPORTS:
@@ -1125,7 +1308,8 @@ def _get_transport(robot: str) -> RobotTransport:
                         f"{robot} (relay selected but {robot.upper()}_RELAY_URL is unset)")
                 else:
                     _TRANSPORTS[robot] = RelayTransport(
-                        robot, relay_url, token, dry_run=DRY_RUN)
+                        robot, relay_url, token, dry_run=DRY_RUN,
+                        udp_port=_relay_udp_port())
             elif robot == "go2":
                 _TRANSPORTS[robot] = Go2Ros2Transport(dry_run=DRY_RUN)
             elif robot == "g1":

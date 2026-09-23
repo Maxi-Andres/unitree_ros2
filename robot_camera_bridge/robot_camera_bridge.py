@@ -84,6 +84,15 @@ BACKEND_WS_URL = os.environ.get("BACKEND_WS_URL", "wss://localhost:8443/ws/robot
 # JPEG path feeds YOLO and the VLM, which do. See h264_relay.py.
 H264_URL = os.environ.get("H264_URL", "")
 H264_WS_URL = os.environ.get("H264_WS_URL", "wss://localhost:8443/ws/robot-h264")
+# Carry the robot -> HQ hop of the drive branch over UDP on this port. Empty or 0 = TCP, the
+# default. Anything that is not a port in 1024-65535 also means TCP: a typo must cost the
+# improvement, never the picture. Why UDP, and what was measured: h264_relay.py.
+_udp = os.environ.get("H264_UDP_PORT", "").strip()
+H264_UDP_PORT = int(_udp) if _udp.isascii() and _udp.isdigit() and 1024 <= int(_udp) <= 65535 \
+    else 0
+if _udp and _udp != "0" and not H264_UDP_PORT:
+    print(f"[camera] H264_UDP_PORT={_udp!r} is not a port in 1024-65535; drive branch stays "
+          f"on TCP", flush=True)
 
 CONTROL_HOST = os.environ.get("CAMERA_CONTROL_HOST", "0.0.0.0")  # noqa: S104  # known finding P0-1: binds broadly, no auth yet
 CONTROL_PORT = int(os.environ.get("CAMERA_CONTROL_PORT", "8091"))
@@ -329,7 +338,8 @@ def main():
     # nothing downstream of it can stall this process. If the robot is not serving /h264 it
     # simply retries with backoff and says so once per attempt.
     if H264_URL:
-        h264_relay.H264Relay(H264_URL, H264_WS_URL, logger=node.get_logger())
+        h264_relay.H264Relay(H264_URL, H264_WS_URL, logger=node.get_logger(),
+                             udp_port=H264_UDP_PORT)
 
     resumed = os.path.exists(_STREAMING_FLAG)
     if START_STREAMING or resumed:
