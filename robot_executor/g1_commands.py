@@ -68,7 +68,10 @@ ARM_STOP_CUSTOM_API_ID = 7113     # arm: cut a running named routine short
 # The 500/501 and 801/802 pairs line up as walk/run for the two waist variants:
 #   walk -> 500 (1-DoF waist) | 501 (3-DoF waist)
 #   run  -> 801 (1-DoF waist) | 802 (3-DoF waist)
-# Our robot answers 501 and 802, i.e. it is the 3-DoF-waist G1.
+# It is NOT two robot variants: it is the app's WAIST LOCK, on this one robot. Read off the
+# bus 2026-10-01 with the lock on (500, 801) and off (501, 802); toggling the lock publishes
+# nothing itself, it only changes which id the app sends. The relay declares it
+# (G1_WAIST_LOCK) and offers only the matching walk.
 #
 # The operating sequence the robot actually needs, hanging on the gantry:
 #   damp (1) -> stand_up / "Preparation" (4) -> a walk or run mode
@@ -87,9 +90,9 @@ FSM_IDS = {
                         # behind safe mode — kept only because it is the documented id.
     "sit": 3,           # [sdk]
     "stand_up": 4,      # [sdk] [robot] observed — the app's Ready/Preparation (L1+UP)
-    "start": 500,       # [sdk] [web]   walk/main operation (R1+X), 1-DoF-waist variant
-    "walk_waist": 501,  # [web] [robot] observed — walk on the 3-DoF-waist variant
-    "run": 801,         # [web]         run (R2+X), 1-DoF-waist variant
+    "start": 500,       # [robot] CONFIRMED 2026-10-01: the app's Walk with the waist LOCKED
+    "walk_waist": 501,  # [web] [robot] observed — walk with the waist free (3-DoF)
+    "run": 801,         # [robot] CONFIRMED 2026-10-01: the app's Run with the waist LOCKED
     "run_waist": 802,   # [robot] observed — CONFIRMED: the app's Run on this robot
     "climb": 812,       # [robot] observed — CONFIRMED: the app's Climb on this robot
                         # (3-DoF waist). By the pair pattern 811 is presumably the

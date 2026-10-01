@@ -83,6 +83,19 @@ def test_a_relay_robot_without_a_ping_address_is_checked_at_its_relay_host(monke
     assert svc._transport_config()["g1"]["ping_ip"] == "192.168.51.115"
 
 
+def test_a_relay_robot_tells_the_pad_what_it_can_be_sent(monkeypatch):
+    monkeypatch.setenv("G1_TRANSPORT", "relay")
+    monkeypatch.setenv("G1_RELAY_URL", "http://192.168.51.115:8092")
+    monkeypatch.setattr(svc, "_relay_health", lambda url: {"ok": True})
+    allowed = svc._transport_config()["g1"]["allowed_skills"]
+    assert "wave_hand" in allowed and "zero_torque" not in allowed
+
+
+def test_a_dds_robot_carries_no_list(monkeypatch):
+    monkeypatch.setenv("G1_TRANSPORT", "dds")
+    assert "allowed_skills" not in svc._transport_config()["g1"]
+
+
 def test_an_explicit_ping_address_wins(monkeypatch):
     monkeypatch.setenv("G1_TRANSPORT", "relay")
     monkeypatch.setenv("G1_RELAY_URL", "http://192.168.51.115:8092")

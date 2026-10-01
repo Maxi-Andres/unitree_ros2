@@ -344,8 +344,28 @@ def _transport_config() -> dict:
         # the 2 s timeout must not be paid for nothing.
         if mode in ("relay", "auto") and url:
             entry["relay"] = _relay_health(url)
+            entry["allowed_skills"] = _relay_allowed_skills(robot, entry["relay"])
         out[robot] = entry
     return out
+
+
+def _relay_allowed_skills(robot: str, health: dict) -> list:
+    """The catalog skills a robot on the relay can actually be sent — for the drive pad.
+
+    The catalog (iacore's GET /skills) lists everything the robot CAN do; over the relay only
+    RelayTransport's allowlist gets through, and the rest comes back "not available over the
+    relay". The pad used to draw the whole catalog, so on the Go2 over LTE most of its buttons
+    (stretch, dances, jumps) could only fail, and on the G1 none of its own names showed up
+    (2026-10-01). A DDS robot carries no list: it can be sent the whole catalog.
+
+    Narrowed further by the verbs the relay ITSELF reports, when it answered: a relay that has
+    not been pulled yet accepts fewer verbs than this table, and its button would only fail.
+    """
+    verb_for_skill = RelayTransport.VERB_FOR_SKILL_BY_ROBOT.get(robot, {})
+    verbs = health.get("verbs")
+    return sorted(s for s, v in verb_for_skill.items()
+                  if not isinstance(verbs, list)
+                  or all(x in verbs for x in (v if isinstance(v, tuple) else (v,))))
 
 
 # THE FILE AND THE PROCESS MUST NOT DISAGREE. The executor reads .env once, at start-up, so a
@@ -1093,6 +1113,8 @@ class RelayTransport(RobotTransport):
     # sender table in robot-command-relay (src/<robot>_command_sender.cpp, and VERBS_BY_MODEL in
     # its relay_server.py). The G1's names are g1_commands' skill names, so its map is one to
     # one, and its ids there are the ones measured on THIS robot. Change one, change both.
+    # A (on, off) pair is an on/off skill: the relay's verbs take no arguments, so params["on"]
+    # picks which of the two is sent.
     VERB_FOR_SKILL_BY_ROBOT: ClassVar[dict] = {"go2": {
         "stop": "stop_move",
         "stand_up": "stand_up",
@@ -1103,11 +1125,16 @@ class RelayTransport(RobotTransport):
         "rise_sit": "rise_sit",
         "damp": "damp",
         "hello": "hello",
+        "stretch": "stretch",
+        "scrape": "scrape",
+        "heart": "heart",
+        "pose": ("pose_on", "pose_off"),
     }, "g1": {
         # Narrower on purpose: no damp, no zero_torque, no SDK squat (fsm 2) — the G1 falls.
         "stop": "stop_move",
         "stand_up": "stand_up",
-        "walk_waist": "walk_waist",
+        "walk_waist": "walk_waist",     # 501, waist free — the relay offers one walk, by its
+        "start": "start",               # 500, waist locked — G1_WAIST_LOCK; /health tells which
         "squat": "squat",
         "lie_up": "lie_up",
         "balance_stand": "balance_stand",
@@ -1307,6 +1334,9 @@ class RelayTransport(RobotTransport):
         if verb is None:
             return {"ok": False, "detail": f"'{skill}' is not available over the relay "
                     f"(remote allowlist: {sorted(self.VERB_FOR_SKILL)} + move/stop)"}
+        if isinstance(verb, tuple):
+            # go2_commands resolved the flag into {"data": bool} (params["on"], default True).
+            verb = verb[0] if (intent.get("parameter") or {}).get("data", True) else verb[1]
         res = self._post({"verb": verb})
         return {"ok": bool(res.get("ok")),
                 "detail": f"{verb} via relay ({res.get('reply')})"}

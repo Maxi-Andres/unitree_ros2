@@ -28,7 +28,8 @@ def g1_transport(monkeypatch):
 
 
 @pytest.mark.parametrize("skill,verb", [
-    ("stand_up", "stand_up"), ("walk_waist", "walk_waist"), ("squat", "squat"),
+    ("stand_up", "stand_up"), ("walk_waist", "walk_waist"), ("start", "start"),
+    ("squat", "squat"),
     ("lie_up", "lie_up"), ("balance_stand", "balance_stand"), ("wave_hand", "wave_hand"),
 ])
 def test_g1_skills_reach_the_relay_as_their_verb(skill, verb, monkeypatch):
@@ -38,13 +39,21 @@ def test_g1_skills_reach_the_relay_as_their_verb(skill, verb, monkeypatch):
     assert sent == [verb]
 
 
-@pytest.mark.parametrize("skill", ["damp", "zero_torque", "squat_sdk", "start", "set_fsm_id",
+@pytest.mark.parametrize("skill", ["damp", "zero_torque", "squat_sdk", "set_fsm_id",
                                    "run_waist", "climb", "shake_hand"])
 def test_g1_dangerous_skills_never_reach_the_relay(skill, monkeypatch):
     t, sent = g1_transport(monkeypatch)
     res = t.execute(skill, {"fsm_id": 0})
     assert not res["ok"], res
     assert sent == []
+
+
+def test_the_pad_offers_the_walk_of_the_waist_the_relay_reports():
+    """Which walk is valid depends on the app's waist lock, which only the relay knows (its
+    G1_WAIST_LOCK). The executor maps both; the relay's /health verbs pick the one shown."""
+    locked = ["stop_move", "stand_up", "start", "wave_hand"]
+    allowed = svc._relay_allowed_skills("g1", {"verbs": locked})
+    assert "start" in allowed and "walk_waist" not in allowed
 
 
 def test_g1_stop_is_a_stop_move(monkeypatch):
