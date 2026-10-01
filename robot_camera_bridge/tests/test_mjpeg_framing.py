@@ -127,7 +127,7 @@ def test_multipart_headers_before_the_soi_are_discarded(monkeypatch):
     """The defect: handing multipart preamble bytes to the consumer as part of the JPEG.
 
     This is the whole reason the scanner looks for markers instead of parsing boundaries:
-    the same code has to survive Frigate, mediamtx and go2_jpeg_stream's raw concatenation.
+    the same code has to survive Frigate, mediamtx and videohub_jpeg_stream's raw concatenation.
     """
     preamble = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 9\r\n\r\n"
     assert _run(monkeypatch, [preamble + _frame(b"x")]) == [_frame(b"x")]
