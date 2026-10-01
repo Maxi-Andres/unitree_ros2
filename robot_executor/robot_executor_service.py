@@ -1033,7 +1033,11 @@ class RelayTransport(RobotTransport):
     robot instead of leaving it walking.
     """
 
-    VERB_FOR_SKILL: ClassVar[dict] = {
+    # PER ROBOT, because the two relays accept different verbs: each must match its robot's
+    # sender table in robot-command-relay (src/<robot>_command_sender.cpp, and VERBS_BY_MODEL in
+    # its relay_server.py). The G1's names are g1_commands' skill names, so its map is one to
+    # one, and its ids there are the ones measured on THIS robot. Change one, change both.
+    VERB_FOR_SKILL_BY_ROBOT: ClassVar[dict] = {"go2": {
         "stop": "stop_move",
         "stand_up": "stand_up",
         "stand_down": "stand_down",
@@ -1043,7 +1047,18 @@ class RelayTransport(RobotTransport):
         "rise_sit": "rise_sit",
         "damp": "damp",
         "hello": "hello",
-    }
+    }, "g1": {
+        # Narrower on purpose: no damp, no zero_torque, no SDK squat (fsm 2) — the G1 falls.
+        "stop": "stop_move",
+        "stand_up": "stand_up",
+        "walk_waist": "walk_waist",
+        "squat": "squat",
+        "lie_up": "lie_up",
+        "balance_stand": "balance_stand",
+        "high_stand": "high_stand",
+        "low_stand": "low_stand",
+        "wave_hand": "wave_hand",
+    }}
     # HTTP refresh. The relay's dead-man is 1000 ms (since 2026-09-23), and over Starlink one
     # POST alone took up to 556 ms — refresh + POST must stay under the window.
     _REFRESH_S = 0.25
@@ -1059,6 +1074,7 @@ class RelayTransport(RobotTransport):
 
     def __init__(self, robot: str, url: str, token: str, dry_run: bool, udp_port: int = 0):
         self._robot = robot
+        self.VERB_FOR_SKILL = self.VERB_FOR_SKILL_BY_ROBOT[robot]
         self._url = url.rstrip("/") + "/cmd"
         self._token = token
         self._dry_run = dry_run
@@ -1207,7 +1223,9 @@ class RelayTransport(RobotTransport):
             self._move_thread.start()
 
     def execute(self, skill: str, params: dict) -> dict:
-        intent = go2_commands.resolve(skill, params or {})
+        # The robot's own resolution: a G1 skill resolved by go2_commands would come back
+        # "unsupported", or mean something else. _CMD_MODULES is defined at module level below.
+        intent = _CMD_MODULES[self._robot].resolve(skill, params or {})
         kind = intent["kind"]
 
         if kind == "unsupported":
@@ -1284,6 +1302,33 @@ def _relay_udp_port() -> int:
     return 0
 
 
+def _relay_token(robot: str) -> str:
+    """The bearer token for `robot`'s relay: its own if it has one, else the shared one.
+
+    Per robot first (<ROBOT>_RELAY_TOKEN, then <ROBOT>_RELAY_TOKEN_FILE), so each robot's
+    relay can hold a token that is revoked on its own — the robots keep it on a Jetson with a
+    factory password. Then the shared RELAY_TOKEN / RELAY_TOKEN_FILE (~/.relay_token), which is
+    what the Go2 has always used, so a setup without per-robot tokens behaves exactly as before.
+    """
+    p = robot.upper()
+    for env_val, env_file in ((f"{p}_RELAY_TOKEN", f"{p}_RELAY_TOKEN_FILE"),
+                              ("RELAY_TOKEN", "RELAY_TOKEN_FILE")):
+        token = os.environ.get(env_val, "").strip()
+        if token:
+            return token
+        path = os.environ.get(env_file, "").strip() or (
+            os.path.expanduser("~/.relay_token") if env_val == "RELAY_TOKEN" else "")
+        if path:
+            try:
+                with open(path) as fh:
+                    token = fh.read().strip()
+            except OSError:
+                token = ""
+            if token:
+                return token
+    return ""
+
+
 def _get_transport(robot: str) -> RobotTransport:
     with _TRANSPORTS_LOCK:
         if robot not in _TRANSPORTS:
@@ -1294,15 +1339,7 @@ def _get_transport(robot: str) -> RobotTransport:
             mode = os.environ.get(f"{robot.upper()}_TRANSPORT", "dds").strip().lower()
             relay_url = os.environ.get(f"{robot.upper()}_RELAY_URL", "").strip()
             if mode == "relay" or (mode == "auto" and relay_url):
-                token = os.environ.get("RELAY_TOKEN", "").strip()
-                if not token:
-                    token_file = os.environ.get(
-                        "RELAY_TOKEN_FILE", os.path.expanduser("~/.relay_token"))
-                    try:
-                        with open(token_file) as fh:
-                            token = fh.read().strip()
-                    except OSError:
-                        token = ""
+                token = _relay_token(robot)
                 if not relay_url:
                     _TRANSPORTS[robot] = UnsupportedRobotTransport(
                         f"{robot} (relay selected but {robot.upper()}_RELAY_URL is unset)")

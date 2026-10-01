@@ -932,8 +932,44 @@ class WhepStreamSource(_LagWatchdog, _ParamSource):
 
 
 
+def _stream_source(url, node, on_frame, cfg, logger=None):
+    """The reader for a video that already left the robot; the URL picks it.
+
+    WHICH URL TO USE, measured and not a matter of taste:
+      .../whep  -> WebRTC, ~200 ms. The drive view, YOLO and the VLM all read this.
+      rtsp://   -> the same stream from the same server, 2455 ms FIXED. Recording only.
+      http://   -> MJPEG. Costs the robot a second copy of the picture over the field
+                  link; it is what WHEP replaced. Kept for Frigate and for the robot's
+                  own :8093 when there is no mediamtx.
+    """
+    kwargs = {}
+    if url.startswith(("rtsp://", "rtsps://")):
+        source = RtspStreamSource
+    elif _is_whep_url(url):
+        source = WhepStreamSource
+        kwargs["ca_file"] = cfg.get("STREAM_TLS_CA", "")
+    else:
+        source = HttpStreamSource
+    return source(
+        node, on_frame,
+        url=url,
+        fps=float(cfg.get("STREAM_FPS", 15)),
+        resolution=cfg.get("STREAM_RESOLUTION", "native"),
+        quality=int(cfg.get("STREAM_QUALITY", 0) or 0), logger=logger, **kwargs)
+
+
 def build_source(robot, node, on_frame, cfg, logger=None):
-    """Factory: pick the CameraSource for `robot` using cfg (env-derived)."""
+    """Factory: pick the CameraSource for `robot` using cfg (env-derived).
+
+    PER-ROBOT STREAM URLS. `GO2_STREAM_URL` / `G1_STREAM_URL`, when set, make `go2` / `g1`
+    read THAT robot's video over the network instead of its DDS. That is the only way either
+    robot works when it is not on this machine's subnet — the Go2 in the field behind the
+    IR1101, the G1 on WiFi — because DDS does not cross a subnet. Without them, `go2` / `g1`
+    stay on DDS exactly as before. Added 2026-10-01: picking the G1 in the app used to fall
+    to DDS and show nothing, while the G1 was streaming fine at http://<g1>:8093/stream.
+    """
+    if robot in ("go2", "g1") and cfg.get(f"{robot.upper()}_STREAM_URL"):
+        return _stream_source(cfg[f"{robot.upper()}_STREAM_URL"], node, on_frame, cfg, logger)
     if robot == "go2":
         # Default quality 0 = forward the robot's own JPEG untouched (decode-free).
         return Go2VideoApiSource(
@@ -962,31 +998,10 @@ def build_source(robot, node, on_frame, cfg, logger=None):
             resolution=cfg.get("G1_RESOLUTION", "native"),
             quality=0, logger=logger)
     if robot == "stream":
-        # No robot subnet required: reads the video that already left the robot. The URL
-        # picks the reader, so moving between transports is one line in .env — no new mode
-        # to remember, and the existing go2|g1|stream|test switch keeps working untouched.
-        #
-        # WHICH URL TO USE, measured and not a matter of taste:
-        #   .../whep  -> WebRTC, ~200 ms. The drive view, YOLO and the VLM all read this.
-        #   rtsp://   -> the same stream from the same server, 2455 ms FIXED. Recording only.
-        #   http://   -> MJPEG. Costs the robot a second copy of the picture over the field
-        #               link; it is what WHEP replaced. Kept for Frigate and for the robot's
-        #               own :8093 when there is no mediamtx.
-        url = cfg.get("STREAM_URL", "http://127.0.0.1:5000/api/robot")
-        kwargs = {}
-        if url.startswith(("rtsp://", "rtsps://")):
-            source = RtspStreamSource
-        elif _is_whep_url(url):
-            source = WhepStreamSource
-            kwargs["ca_file"] = cfg.get("STREAM_TLS_CA", "")
-        else:
-            source = HttpStreamSource
-        return source(
-            node, on_frame,
-            url=url,
-            fps=float(cfg.get("STREAM_FPS", 15)),
-            resolution=cfg.get("STREAM_RESOLUTION", "native"),
-            quality=int(cfg.get("STREAM_QUALITY", 0) or 0), logger=logger, **kwargs)
+        # No robot subnet required: reads the video that already left the robot, whichever
+        # robot that is. The per-robot URLs above are the same thing chosen by robot.
+        url = cfg.get("STREAM_URL", "http://127.0.0.1:5000/api/go2")
+        return _stream_source(url, node, on_frame, cfg, logger)
     if robot == "test":
         return TestPatternSource(
             node, on_frame, fps=float(cfg.get("TEST_FPS", 15)),

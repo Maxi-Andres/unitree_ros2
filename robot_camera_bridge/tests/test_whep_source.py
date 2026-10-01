@@ -35,7 +35,7 @@ import pytest
     ("https://hq.example:8889/robot/whep/", True),      # a trailing slash is still WHEP
     ("https://127.0.0.1:8889/robot/whip", False),       # publishing, not playing
     ("http://10.1.254.18:8093/stream", False),          # the robot's MJPEG
-    ("http://127.0.0.1:5000/api/robot", False),         # Frigate
+    ("http://127.0.0.1:5000/api/go2", False),           # Frigate
     ("rtsp://127.0.0.1:8554/robot", False),
     ("https://127.0.0.1:8889/whepsomething", False),    # not a /whep path segment
 ])

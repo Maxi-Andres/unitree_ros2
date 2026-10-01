@@ -83,6 +83,13 @@ BACKEND_WS_URL = os.environ.get("BACKEND_WS_URL", "wss://localhost:8443/ws/robot
 # everything above on purpose — these bytes are H.264 and nothing here decodes them, while the
 # JPEG path feeds YOLO and the VLM, which do. See h264_relay.py.
 H264_URL = os.environ.get("H264_URL", "")
+# Per robot, like GO2_STREAM_URL / G1_STREAM_URL for the picture: picking a robot in the app
+# also points the drive branch at THAT robot's /h264. H264_URL stays the fallback.
+H264_URL_BY_ROBOT = {r: os.environ.get(f"{r.upper()}_H264_URL", "") for r in ("go2", "g1")}
+
+
+def h264_url_for(robot):
+    return H264_URL_BY_ROBOT.get(robot) or H264_URL
 H264_WS_URL = os.environ.get("H264_WS_URL", "wss://localhost:8443/ws/robot-h264")
 # Carry the robot -> HQ hop of the drive branch over UDP on this port. Empty or 0 = TCP, the
 # default. Anything that is not a port in 1024-65535 also means TCP: a typo must cost the
@@ -102,6 +109,7 @@ SOURCE_CFG = {k: os.environ[k] for k in (
     "GO2_VIDEO_FPS", "GO2_RESOLUTION", "JPEG_QUALITY",
     "G1_CAMERA_SOURCE", "G1_IMAGE_TOPIC", "G1_VIDEO_FPS", "G1_RESOLUTION",
     "STREAM_URL", "STREAM_FPS", "STREAM_RESOLUTION", "STREAM_QUALITY", "STREAM_TLS_CA",
+    "GO2_STREAM_URL", "G1_STREAM_URL",
     "TEST_FPS") if k in os.environ}
 
 
@@ -111,8 +119,9 @@ class SourceManager:
     the ROS executor thread, so /config only records a `pending` robot and a
     supervisor timer applies it. fps/resolution/quality are forwarded to the source."""
 
-    def __init__(self, node, on_frame, cfg, robot):
+    def __init__(self, node, on_frame, cfg, robot, relay=None):
         self._node = node
+        self._relay = relay              # the drive branch follows the picture when set
         self._on_frame = on_frame
         self._cfg = cfg
         self._lock = threading.Lock()
@@ -137,6 +146,8 @@ class SourceManager:
                 logger=self._node.get_logger())
             self._robot = pending
             self._node.get_logger().info(f"camera source switched to '{pending}'")
+            if self._relay is not None:
+                self._relay.retarget(h264_url_for(pending))
         except Exception as e:
             self._node.get_logger().error(f"camera switch to '{pending}' failed: {e}")
 
@@ -309,8 +320,16 @@ def main():
     rclpy.init()
     node = rclpy.create_node("aivl_robot_camera_bridge")
     bridge = CameraBridge()
+    # Independent of the JPEG path and of the streaming flag: it carries no detections and
+    # nothing downstream of it can stall this process. If the robot is not serving /h264 it
+    # simply retries with backoff and says so once per attempt. Built BEFORE the source
+    # manager so a robot switch can point it at the new robot.
+    relay = None
+    if h264_url_for(ROBOT):
+        relay = h264_relay.H264Relay(h264_url_for(ROBOT), H264_WS_URL,
+                                     logger=node.get_logger(), udp_port=H264_UDP_PORT)
     try:
-        mgr = SourceManager(node, bridge.on_frame, SOURCE_CFG, ROBOT)
+        mgr = SourceManager(node, bridge.on_frame, SOURCE_CFG, ROBOT, relay=relay)
     except Exception as e:
         node.get_logger().error(f"camera source '{ROBOT}' failed to init: {e}")
         raise
@@ -333,13 +352,6 @@ def main():
             rclpy.shutdown()
         return 3
     threading.Thread(target=server.serve_forever, daemon=True).start()
-
-    # Independent of the JPEG path and of the streaming flag: it carries no detections and
-    # nothing downstream of it can stall this process. If the robot is not serving /h264 it
-    # simply retries with backoff and says so once per attempt.
-    if H264_URL:
-        h264_relay.H264Relay(H264_URL, H264_WS_URL, logger=node.get_logger(),
-                             udp_port=H264_UDP_PORT)
 
     resumed = os.path.exists(_STREAMING_FLAG)
     if START_STREAMING or resumed:

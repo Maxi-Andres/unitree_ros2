@@ -305,6 +305,8 @@ class H264Relay:
         self._udp_port = udp_port
         self._tcp_until = 0.0
         self._stop = threading.Event()
+        # Set by retarget(): the pump in flight returns, the loop reconnects to the new URL.
+        self._switch = threading.Event()
         self.frames = 0
         self.dropped = 0
         self.transport = "udp" if udp_port else "tcp"
@@ -315,9 +317,29 @@ class H264Relay:
             via = f"udp :{udp_port}" if udp_port else "tcp"
             logger.info(f"[h264] relaying {robot_url} ({via}) -> {backend_url}")
 
+    def retarget(self, robot_url):
+        """Relay another robot's `/h264` from now on (the operator picked another robot).
+
+        The SAME thread reconnects, on purpose: the UDP path binds a fixed port, and a second
+        relay started next to this one would race it for that port. The pump in flight sees
+        the switch within ~1 s on UDP (its select timeout) and at the next chunk on TCP; a
+        robot that is down holds it until urlopen's 10 s timeout at most.
+        """
+        if not robot_url or robot_url == self._url:
+            return
+        self._url = robot_url
+        self._tcp_until = 0.0            # a TCP verdict about the OLD robot says nothing here
+        self._switch.set()
+        if self._log:
+            self._log.info(f"[h264] retargeting to {robot_url}")
+
     def _run(self):
         backoff = 1.0
         while not self._stop.is_set():
+            if self._switch.is_set():
+                self._switch.clear()
+                self._close()
+                backoff = 1.0
             started = time.monotonic()
             try:
                 if self._udp_port and time.monotonic() >= self._tcp_until:
@@ -336,11 +358,17 @@ class H264Relay:
             except Exception as exc:
                 if time.monotonic() - started >= self._HEALTHY_S:
                     backoff = 1.0
+                if self._switch.is_set():
+                    continue                 # the old robot failing is not a reason to wait
                 if self._log and not self._stop.is_set():
                     self._log.warn(f"[h264] relay {self._url} failed: {exc}; "
                                    f"retry in {backoff:.0f}s")
                 self._close()
-                self._stop.wait(backoff)
+                # Woken early by a stop OR a retarget, so a switch never waits out a backoff.
+                deadline = time.monotonic() + backoff
+                while (time.monotonic() < deadline and not self._stop.is_set()
+                       and not self._switch.is_set()):
+                    self._switch.wait(0.2)
                 backoff = min(backoff * 2, self._MAX_BACKOFF_S)
 
     def _connect_backend(self):
@@ -392,7 +420,7 @@ class H264Relay:
         self._connect_backend()
         req = urllib.request.Request(self._url, headers={"User-Agent": "ai-vl-h264-relay"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not self._switch.is_set():
                 if until is not None and time.monotonic() >= until:
                     self._close()
                     return
@@ -469,7 +497,7 @@ class H264Relay:
         last_beat = time.monotonic()
         announced = False
         lease_fd = resp.fileno()
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not self._switch.is_set():
             ready = select.select([sock, lease_fd], [], [], 1.0)[0]
             now = time.monotonic()
             frames = []
