@@ -112,9 +112,18 @@ def resolve(skill, params):
       {"kind": "move", "vx","vy","vyaw", "duration": float|None, "continuous": bool}
       {"kind": "stop"}
       {"kind": "single", "api_id": int, "parameter": dict|None}
+      {"kind": "joy", "lx","ly","rx","ry"}   (each clamped to -1..1)
       {"kind": "unsupported", "reason": str}
     """
     params = params or {}
+
+    # Joystick sticks for POSE mode. In pose the Go2 tilts and turns its body from the
+    # joystick topic (rt/wirelesscontroller), not from Move — read off the bus 2026-10-01 with
+    # the Unitree app. Not a catalog skill: the drive pad sends it while pose is on, and the
+    # relay's sender refuses it outside pose (there the same sticks would walk the robot).
+    if skill == "joy":
+        return {"kind": "joy", **{k: _clamp(params.get(k), 1.0)
+                                  for k in ("lx", "ly", "rx", "ry")}}
 
     # Direct velocity control (the drive-pad joysticks / WASD): raw vx/vy/vyaw,
     # continuous by default, clamped to the safety limits above.

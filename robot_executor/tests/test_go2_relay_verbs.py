@@ -86,3 +86,19 @@ def test_pose_needs_both_of_its_verbs():
     verbs = ["stop_move", "pose_on"]
     assert "pose" not in svc._relay_allowed_skills("go2", {"verbs": verbs})
     assert "pose" in svc._relay_allowed_skills("go2", {"verbs": [*verbs, "pose_off"]})
+
+
+def test_pose_joystick_reaches_the_relay_clamped(monkeypatch):
+    """Pose is steered by joystick sticks, not Move (read off the bus 2026-10-01)."""
+    t = svc.RelayTransport("go2", "http://stub", "tok", dry_run=True)
+    sent = []
+    real = t._post
+    monkeypatch.setattr(t, "_post", lambda body: (sent.append(body), real(body))[1])
+    assert t.execute("joy", {"rx": 3, "ry": -0.4})["ok"]
+    assert sent == [{"verb": "joy", "lx": 0.0, "ly": 0.0, "rx": 1.0, "ry": -0.4}]
+
+
+def test_the_dds_transport_says_joy_is_relay_only():
+    t = svc.Go2Ros2Transport(dry_run=True)
+    res = t.execute("joy", {"rx": 0.2})
+    assert not res["ok"] and "relay" in res["detail"]

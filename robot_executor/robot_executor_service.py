@@ -656,6 +656,10 @@ class Go2Ros2Transport(RobotTransport):
             return {"ok": True, "detail": f"Move vx={intent['vx']} vy={intent['vy']} "
                     f"vyaw={intent['vyaw']} ({mode})", "api_id": go2_commands.MOVE_API_ID}
 
+        if kind == "joy":
+            return {"ok": False, "detail": "pose joystick is only implemented over the relay "
+                    "(its sender publishes rt/wirelesscontroller and gates it to pose)"}
+
         # single
         self._publish(intent["api_id"], intent["parameter"])
         return {"ok": True, "detail": f"sport api_id={intent['api_id']}",
@@ -1403,6 +1407,12 @@ class RelayTransport(RobotTransport):
                 f"{intent['duration'] or DEFAULT_STEP_S:.1f}s step"
             return {"ok": True, "detail": f"Move via relay vx={intent['vx']} "
                     f"vy={intent['vy']} vyaw={intent['vyaw']} ({mode})"}
+
+        if kind == "joy":
+            # Each call is one sample; the sender re-publishes it at 10 Hz and zeroes it when
+            # it goes stale, so nothing here has to loop. Refused by the sender outside pose.
+            res = self._post({"verb": "joy", **{k: intent[k] for k in ("lx", "ly", "rx", "ry")}})
+            return {"ok": bool(res.get("ok")), "detail": f"joy via relay ({res.get('reply')})"}
 
         verb = self.VERB_FOR_SKILL.get(skill)
         if verb is None:
