@@ -345,6 +345,7 @@ def _transport_config() -> dict:
         if mode in ("relay", "auto") and url:
             entry["relay"] = _relay_health(url)
             entry["allowed_skills"] = _relay_allowed_skills(robot, entry["relay"])
+            entry["allowed_values"] = _relay_allowed_values(robot, entry["relay"])
         out[robot] = entry
     return out
 
@@ -362,10 +363,47 @@ def _relay_allowed_skills(robot: str, health: dict) -> list:
     not been pulled yet accepts fewer verbs than this table, and its button would only fail.
     """
     verb_for_skill = RelayTransport.VERB_FOR_SKILL_BY_ROBOT.get(robot, {})
-    verbs = health.get("verbs")
-    return sorted(s for s, v in verb_for_skill.items()
-                  if not isinstance(verbs, list)
-                  or all(x in verbs for x in (v if isinstance(v, tuple) else (v,))))
+    choices = _relay_allowed_values(robot, health)
+    out = []
+    for s, v in verb_for_skill.items():
+        if isinstance(v, dict):
+            if any(choices.get(s, {}).values()):
+                out.append(s)
+        elif _relay_accepts(health, v if isinstance(v, tuple) else (v,)):
+            out.append(s)
+    return sorted(out)
+
+
+def _relay_accepts(health: dict, verbs) -> bool:
+    """True when the relay reports every one of `verbs` — or reported no list at all."""
+    have = health.get("verbs")
+    return not isinstance(have, list) or all(v in have for v in verbs)
+
+
+def _relay_allowed_values(robot: str, health: dict) -> dict:
+    """For each choice skill, the values the relay can be sent: {skill: {param: [values]}}.
+
+    A choice skill (arm_action, dance, set_gait) is ONE button block on the pad but one relay
+    verb per value, and only some values have one — the pad marks the rest value by value."""
+    out = {}
+    for s, v in RelayTransport.VERB_FOR_SKILL_BY_ROBOT.get(robot, {}).items():
+        if isinstance(v, dict):
+            ((param, table),) = v.items()
+            out[s] = {param: sorted(val for val, verb in table.items()
+                                    if _relay_accepts(health, (verb,)))}
+    return out
+
+
+def _relay_error_hint(robot: str, res: dict) -> str:
+    """What a failed relay reply means, when the sender passed the robot's own code through
+    (e.g. "err action_hug 7404": the G1 is not in Run). Empty when there is nothing to add."""
+    if res.get("ok"):
+        return ""
+    tail = str(res.get("reply") or "").split()[-1:]
+    if not tail or not tail[0].lstrip("-").isdigit():
+        return ""
+    hints = getattr(_CMD_MODULES.get(robot), "ERROR_HINTS", {})
+    return hints.get(int(tail[0]), "")
 
 
 # THE FILE AND THE PROCESS MUST NOT DISAGREE. The executor reads .env once, at start-up, so a
@@ -1101,8 +1139,9 @@ class RelayTransport(RobotTransport):
 
     Skill resolution is reused from go2_commands, so a skill behaves the same over DDS or
     over the WAN. What differs is the ALLOWLIST: only the verbs below can be sent remotely.
-    Acrobatics (flips, jumps, dances, handstand) are deliberately absent, and the relay
-    would refuse them anyway — driving a robot you cannot see should not be able to flip it.
+    Since 2026-10-01 that is nearly everything each robot does, acrobatics and limp modes
+    included (the operator's call); what can hurt the robot is held back by SAFE MODE, which
+    the request handler applies before any transport — the relay has no safe mode of its own.
 
     Movement is re-sent while it lasts rather than latched once: the relay runs a dead-man
     switch and stops the robot if a movement is not refreshed, so a dropped link stops the
@@ -1113,8 +1152,10 @@ class RelayTransport(RobotTransport):
     # sender table in robot-command-relay (src/<robot>_command_sender.cpp, and VERBS_BY_MODEL in
     # its relay_server.py). The G1's names are g1_commands' skill names, so its map is one to
     # one, and its ids there are the ones measured on THIS robot. Change one, change both.
-    # A (on, off) pair is an on/off skill: the relay's verbs take no arguments, so params["on"]
-    # picks which of the two is sent.
+    # The relay's verbs take no arguments, so a skill with a parameter maps to several verbs:
+    #   (on, off)              an on/off skill — params["on"] picks the side.
+    #   {param: {value: verb}} a choice skill — params[param] picks the verb; a value missing
+    #                          here is not available over the relay.
     VERB_FOR_SKILL_BY_ROBOT: ClassVar[dict] = {"go2": {
         "stop": "stop_move",
         "stand_up": "stand_up",
@@ -1129,8 +1170,19 @@ class RelayTransport(RobotTransport):
         "scrape": "scrape",
         "heart": "heart",
         "pose": ("pose_on", "pose_off"),
+        "dance1": "dance1",
+        "dance2": "dance2",
+        "front_jump": "front_jump",
+        "front_pounce": "front_pounce",
+        "front_flip": "front_flip",
+        "back_flip": "back_flip",
+        "left_flip": "left_flip",
+        "handstand": ("handstand_on", "handstand_off"),
+        "walk_upright": ("walk_upright_on", "walk_upright_off"),
+        "set_gait": {"gait": {g: f"gait_{g}" for g in go2_commands.GO2_GAIT_API}},
     }, "g1": {
-        # Narrower on purpose: no damp, no zero_torque, no SDK squat (fsm 2) — the G1 falls.
+        # Out: the SDK squat (fsm 2, half-falls), sit (fsm 3, never seen), high five (started
+        # falling backwards), the raw modes (they take a number). g1_command_sender.cpp.
         "stop": "stop_move",
         "stand_up": "stand_up",
         "walk_waist": "walk_waist",     # 501, waist free — the relay offers one walk, by its
@@ -1141,6 +1193,28 @@ class RelayTransport(RobotTransport):
         "high_stand": "high_stand",
         "low_stand": "low_stand",
         "wave_hand": "wave_hand",
+        "run": "run",                   # 801, waist locked } one of the pair, like the walk
+        "run_waist": "run_waist",       # 802, waist free   }
+        "climb": "climb",
+        "damp": "damp",
+        "zero_torque": "zero_torque",
+        "shake_hand": "action_shake_hand",
+        # The app's actions (FSM 550 + code, read off the bus) where they were watched; the
+        # arm service's ids for the rest. high_five is left out on purpose.
+        "arm_action": {"action": {
+            **{a: f"action_{a}" for a in ("hug", "clap", "face_wave", "left_kiss", "heart",
+                                          "hands_up", "x_ray", "right_hand_up", "reject",
+                                          "shake_hand")},
+            **{a: f"arm_{a}" for a in ("release_arm", "turn_back_wave", "two_hand_kiss",
+                                       "right_kiss", "right_heart", "high_wave",
+                                       "box_win_left", "box_win_right", "box_win_both",
+                                       "hand_on_heart", "hands_up_right", "forward_push")},
+        }},
+        "dance": {"name": {"Waist_Drum_Dance": "dance_waist_drum",
+                           "Scratch_head": "dance_scratch_head",
+                           "Spin_discs": "dance_spin_discs",
+                           "Throw_money": "dance_throw_money"}},
+        "stop_dance": "stop_dance",
     }}
     # HTTP refresh. The relay's dead-man is 1000 ms (since 2026-09-23), and over Starlink one
     # POST alone took up to 556 ms — refresh + POST must stay under the window.
@@ -1337,9 +1411,17 @@ class RelayTransport(RobotTransport):
         if isinstance(verb, tuple):
             # go2_commands resolved the flag into {"data": bool} (params["on"], default True).
             verb = verb[0] if (intent.get("parameter") or {}).get("data", True) else verb[1]
+        elif isinstance(verb, dict):
+            ((param, table),) = verb.items()
+            value = (params or {}).get(param)
+            verb = table.get(value)
+            if verb is None:
+                return {"ok": False, "detail": f"'{skill}' {param}={value!r} is not available "
+                        f"over the relay (available: {sorted(table)})"}
         res = self._post({"verb": verb})
-        return {"ok": bool(res.get("ok")),
-                "detail": f"{verb} via relay ({res.get('reply')})"}
+        detail = f"{verb} via relay ({res.get('reply')})"
+        hint = _relay_error_hint(self._robot, res)
+        return {"ok": bool(res.get("ok")), "detail": f"{detail} — {hint}" if hint else detail}
 
     def shutdown(self, stop_first: bool = True):
         with self._move_lock:

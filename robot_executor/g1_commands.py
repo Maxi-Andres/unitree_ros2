@@ -143,7 +143,9 @@ ERROR_HINTS = {
     7401: "The arm is holding its last action; send 'release_arm' (or repeat the same "
           "action) to let go.",
     7402: "Invalid arm action id.",
-    7404: f"Arm actions only work in fsm id {GESTURE_FSM_IDS} — run 'Preparation' first.",
+    # Over the relay the sender returns this itself for the app's actions (FSM 550 + code),
+    # which play ONLY from Run: from Walk the robot answers 0 and does nothing (2026-10-01).
+    7404: "Arm actions need the robot in Run mode — switch to Run first.",
 }
 
 # Skills that need the robot to already be in an operation state (GESTURE_FSM_IDS).
@@ -216,7 +218,8 @@ G1_SPEED_PRESETS = {
 DEFAULT_SPEED = "slow"
 
 # Safety clamps for direct velocity control (the drive pad's `move` skill).
-MAX_VX = 0.8
+# At or above the drive pad's fast preset (ControlPage SPEEDS.g1), or "fast" is not fast.
+MAX_VX = 1.2
 MAX_VY = 0.5
 MAX_VYAW = 1.2
 

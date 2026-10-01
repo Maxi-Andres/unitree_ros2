@@ -20,9 +20,10 @@ GO2_SPEED_PRESETS = {
 DEFAULT_SPEED = "slow"
 
 # Safety clamps for direct velocity control (the `move` skill from the drive pad).
-MAX_VX = 1.2    # m/s forward/back
-MAX_VY = 0.8    # m/s strafe left/right
-MAX_VYAW = 2.0  # rad/s yaw
+# At or above the drive pad's fast preset (ControlPage SPEEDS.go2), or "fast" is not fast.
+MAX_VX = 2.0    # m/s forward/back
+MAX_VY = 1.0    # m/s strafe left/right
+MAX_VYAW = 3.0  # rad/s yaw
 
 MOVE_API_ID = 1008
 STOPMOVE_API_ID = 1003

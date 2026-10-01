@@ -39,13 +39,49 @@ def test_g1_skills_reach_the_relay_as_their_verb(skill, verb, monkeypatch):
     assert sent == [verb]
 
 
-@pytest.mark.parametrize("skill", ["damp", "zero_torque", "squat_sdk", "set_fsm_id",
-                                   "run_waist", "climb", "shake_hand"])
-def test_g1_dangerous_skills_never_reach_the_relay(skill, monkeypatch):
+@pytest.mark.parametrize("skill", ["squat_sdk", "sit", "set_fsm_id", "set_speed_mode",
+                                   "switch_mode"])
+def test_what_misbehaved_or_takes_a_number_never_reaches_the_relay(skill, monkeypatch):
     t, sent = g1_transport(monkeypatch)
     res = t.execute(skill, {"fsm_id": 0})
     assert not res["ok"], res
     assert sent == []
+
+
+@pytest.mark.parametrize("params,verb", [
+    ({"action": "hug"}, "action_hug"), ({"action": "shake_hand"}, "action_shake_hand"),
+    ({"action": "high_wave"}, "arm_high_wave"),
+])
+def test_g1_arm_actions_pick_their_own_verb(params, verb, monkeypatch):
+    t, sent = g1_transport(monkeypatch)
+    assert t.execute("arm_action", params)["ok"]
+    assert sent == [verb]
+
+
+def test_high_five_is_refused_before_the_relay(monkeypatch):
+    """It started the robot falling backwards (2026-10-01)."""
+    t, sent = g1_transport(monkeypatch)
+    res = t.execute("arm_action", {"action": "high_five"})
+    assert not res["ok"] and sent == []
+
+
+def test_safe_mode_still_holds_back_what_drops_the_g1():
+    import g1_commands
+    assert {"damp", "zero_torque", "dance"} <= g1_commands.DANGEROUS_SKILLS
+
+
+def test_the_pad_marks_arm_actions_one_by_one():
+    """arm_action is one block on the pad but one relay verb per action."""
+    vals = svc._relay_allowed_values("g1", {"verbs": ["stop_move", "action_hug"]})
+    assert vals["arm_action"]["action"] == ["hug"]
+    assert "arm_action" in svc._relay_allowed_skills("g1", {"verbs": ["action_hug"]})
+    assert "arm_action" not in svc._relay_allowed_skills("g1", {"verbs": ["stop_move"]})
+
+
+def test_a_7404_from_the_relay_tells_the_operator_to_switch_to_run():
+    hint = svc._relay_error_hint("g1", {"ok": False, "reply": "err action_hug 7404"})
+    assert "Run" in hint
+    assert svc._relay_error_hint("g1", {"ok": True, "reply": "ok action_hug 0"}) == ""
 
 
 def test_the_pad_offers_the_walk_of_the_waist_the_relay_reports():

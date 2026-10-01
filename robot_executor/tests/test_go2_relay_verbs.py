@@ -42,10 +42,29 @@ def test_pose_on_and_off_are_separate_verbs(params, verb, monkeypatch):
     assert sent == [verb]
 
 
-@pytest.mark.parametrize("skill", ["front_flip", "back_flip", "handstand", "dance1"])
-def test_go2_acrobatics_still_never_reach_the_relay(skill, monkeypatch):
+@pytest.mark.parametrize("skill,params,verb", [
+    ("front_flip", {}, "front_flip"), ("dance1", {}, "dance1"),
+    ("handstand", {"on": True}, "handstand_on"), ("walk_upright", {"on": False},
+                                                  "walk_upright_off"),
+    ("set_gait", {"gait": "free_walk"}, "gait_free_walk"),
+])
+def test_go2_acrobatics_and_gaits_reach_the_relay(skill, params, verb, monkeypatch):
+    """Since 2026-10-01 the relay carries them; safe mode is what holds them back (below)."""
     t, sent = go2_transport(monkeypatch)
-    assert not t.execute(skill, {})["ok"]
+    assert t.execute(skill, params)["ok"]
+    assert sent == [verb]
+
+
+def test_safe_mode_still_holds_back_every_go2_acrobatic():
+    import go2_commands
+    for skill in ("front_flip", "back_flip", "left_flip", "front_jump", "front_pounce",
+                  "handstand", "walk_upright", "dance1", "dance2", "damp"):
+        assert skill in go2_commands.DANGEROUS_SKILLS
+
+
+def test_an_unknown_gait_is_refused_before_the_relay(monkeypatch):
+    t, sent = go2_transport(monkeypatch)
+    assert not t.execute("set_gait", {"gait": "moonwalk"})["ok"]
     assert sent == []
 
 

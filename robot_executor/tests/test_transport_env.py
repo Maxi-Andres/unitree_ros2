@@ -88,7 +88,7 @@ def test_a_relay_robot_tells_the_pad_what_it_can_be_sent(monkeypatch):
     monkeypatch.setenv("G1_RELAY_URL", "http://192.168.51.115:8092")
     monkeypatch.setattr(svc, "_relay_health", lambda url: {"ok": True})
     allowed = svc._transport_config()["g1"]["allowed_skills"]
-    assert "wave_hand" in allowed and "zero_torque" not in allowed
+    assert "wave_hand" in allowed and "squat_sdk" not in allowed
 
 
 def test_a_dds_robot_carries_no_list(monkeypatch):
