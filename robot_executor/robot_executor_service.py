@@ -200,6 +200,22 @@ def _write_dds_env(iface: str, peers: list) -> None:
 ENV_PATH = os.path.join(_HERE, ".env")
 
 
+def _env_file_get(key: str) -> str:
+    """The value of `key` in robot_executor/.env right now — NOT in this process's environ.
+
+    They differ whenever the file was edited by hand after the executor started, and filling a
+    missing field from the stale process copy is exactly how a ping-address save wrote
+    G1_TRANSPORT=dds back over a hand-set `relay` on 2026-10-01.
+    """
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                k, sep, v = line.partition("=")
+                if sep and k.strip() == key:
+                    return v.strip()
+    return os.environ.get(key, "")
+
+
 def _set_env_keys(updates: dict) -> None:
     """Persist KEY=VALUE pairs into robot_executor/.env, replacing existing keys.
 
@@ -315,8 +331,14 @@ def _transport_config() -> dict:
         # Address to probe for "is this robot up". Stored here so every viewer agrees, but
         # PROBED BY THE BACKEND: ping needs raw sockets, which are unavailable in this
         # container, and the backend runs on the host where they work.
-        entry = {"mode": mode, "url": url,
-                 "ping_ip": os.environ.get(f"{prefix}_PING_IP", "").strip()}
+        # NO ADDRESS SET = THE RELAY'S HOST. Every robot must be checked all the time, whichever
+        # one is selected: with no ping address the header fell back to "is its camera the
+        # active one", so a robot read "connected" only while selected and "unknown" otherwise
+        # (2026-10-01). A robot on a relay has an address already — its relay URL's host.
+        ping_ip = os.environ.get(f"{prefix}_PING_IP", "").strip()
+        if not ping_ip and mode in ("relay", "auto") and url:
+            ping_ip = urllib.parse.urlsplit(url).hostname or ""
+        entry = {"mode": mode, "url": url, "ping_ip": ping_ip}
         # Only when a relay is actually in use: no point probing an unconfigured robot, and
         # the 2 s timeout must not be paid for nothing.
         if mode in ("relay", "auto") and url:
@@ -1431,15 +1453,20 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": f"unknown robot '{robot}'"})
             return
         prefix_now = robot.upper()
+        # ONLY WHAT WAS SENT IS WRITTEN. A field missing from the request is left as it is in
+        # the FILE — never refilled from this process's environment, which is stale whenever
+        # the file was edited by hand after start-up. Refilling it is how saving a ping address
+        # put G1_TRANSPORT back to dds over a hand-set relay (2026-10-01).
+        mode_given = bool(body.get("mode"))
         mode = str(body.get("mode")
-                   or os.environ.get(f"{prefix_now}_TRANSPORT", "dds")).strip().lower()
+                   or _env_file_get(f"{prefix_now}_TRANSPORT") or "dds").strip().lower()
         if mode not in ("dds", "relay", "auto"):
             self._send(400, {"ok": False,
                              "error": "'mode' must be dds, relay or auto"})
             return
 
         prefix = robot.upper()
-        updates = {f"{prefix}_TRANSPORT": mode}
+        updates = {f"{prefix}_TRANSPORT": mode} if mode_given else {}
         if "ping_ip" in body:
             ping_ip = str(body.get("ping_ip") or "").strip()
             if ping_ip and not _valid_peer(ping_ip):
@@ -1462,16 +1489,28 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                                           "'relay' — switch to 'dds' first"})
                 return
             updates[f"{prefix}_RELAY_URL"] = url
-        elif mode == "relay" and not os.environ.get(f"{prefix}_RELAY_URL", "").strip():
+        elif mode_given and mode == "relay" and not _env_file_get(f"{prefix}_RELAY_URL"):
             self._send(400, {"ok": False,
                              "error": f"mode 'relay' needs a url ({prefix}_RELAY_URL is "
                                       f"unset)"})
             return
 
+        if not updates:
+            self._send(400, {"ok": False, "error": "nothing to change (send mode, url or ping_ip)"})
+            return
         try:
             _set_env_keys(updates)
         except OSError as e:
             self._send(500, {"ok": False, "error": f"could not write {ENV_PATH}: {e}"})
+            return
+
+        # The ping address is only read by /transport, never by a transport: apply it in place.
+        # Restarting for it dropped every command path for a few seconds over a field that only
+        # lights a dot — and the UI already promised it would not restart.
+        if set(updates) == {f"{prefix}_PING_IP"}:
+            os.environ.update(updates)
+            self._send(200, {"ok": True, "robot": robot, "mode": mode, "restarting": False,
+                             "detail": "online-check address saved"})
             return
 
         self._send(200, {"ok": True, "robot": robot, "mode": mode,
