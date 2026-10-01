@@ -240,6 +240,7 @@ def _set_env_keys(updates: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(out).rstrip("\n") + "\n")
     os.replace(tmp, ENV_PATH)
+    _ENV_SEEN["mtime"] = _env_mtime()   # our own write: not a reason for the watcher to restart
 
     # Overwrite the live environment too, or the change silently never applies: .env is
     # loaded with setdefault(), so an existing value wins, and _restart_self() re-execs and
@@ -345,6 +346,39 @@ def _transport_config() -> dict:
             entry["relay"] = _relay_health(url)
         out[robot] = entry
     return out
+
+
+# THE FILE AND THE PROCESS MUST NOT DISAGREE. The executor reads .env once, at start-up, so a
+# hand edit used to sit unread until a restart nobody remembered: on 2026-10-01 the file said
+# G1_TRANSPORT=relay for hours while the running executor still drove the G1 over dds — and a
+# later UI save even wrote the stale value back. So the file is watched: changed by anything
+# but this process, the executor restarts and applies it. A restart stops the robots first
+# (see _restart_self), so an edit mid-drive costs a stop, never a robot left moving.
+_ENV_SEEN = {"mtime": None}
+_ENV_POLL_S = 2.0
+
+
+def _env_mtime():
+    try:
+        return os.stat(ENV_PATH).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _env_changed_outside() -> bool:
+    """True when .env changed since start-up or since this process last wrote it."""
+    return _env_mtime() != _ENV_SEEN["mtime"]
+
+
+def _watch_env_file():
+    _ENV_SEEN["mtime"] = _env_mtime()
+    while True:
+        time.sleep(_ENV_POLL_S)
+        if _env_changed_outside():
+            print(f"[executor] {ENV_PATH} changed outside the executor — restarting to apply "
+                  f"it", flush=True)
+            _restart_self()
+            return
 
 
 def _restart_self():
@@ -1661,6 +1695,7 @@ def main():
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
+    threading.Thread(target=_watch_env_file, name="env-watch", daemon=True).start()
 
     try:
         server.serve_forever()

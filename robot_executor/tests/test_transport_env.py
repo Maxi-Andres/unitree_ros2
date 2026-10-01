@@ -89,3 +89,26 @@ def test_an_explicit_ping_address_wins(monkeypatch):
     monkeypatch.setenv("G1_PING_IP", "192.168.123.164")
     monkeypatch.setattr(svc, "_relay_health", lambda url: {"ok": True})
     assert svc._transport_config()["g1"]["ping_ip"] == "192.168.123.164"
+
+
+def test_a_hand_edit_of_env_is_noticed(tmp_path, monkeypatch):
+    f = tmp_path / ".env"
+    f.write_text("G1_TRANSPORT=dds\n")
+    monkeypatch.setattr(svc, "ENV_PATH", str(f))
+    svc._ENV_SEEN["mtime"] = svc._env_mtime()
+    assert not svc._env_changed_outside()
+    import os
+    import time
+    time.sleep(0.01)
+    f.write_text("G1_TRANSPORT=relay\n")                  # someone runs sed on it
+    os.utime(f, ns=(time.time_ns(), time.time_ns()))
+    assert svc._env_changed_outside()
+
+
+def test_the_executors_own_write_is_not_a_hand_edit(tmp_path, monkeypatch):
+    f = tmp_path / ".env"
+    f.write_text("G1_TRANSPORT=relay\n")
+    monkeypatch.setattr(svc, "ENV_PATH", str(f))
+    svc._ENV_SEEN["mtime"] = svc._env_mtime()
+    svc._set_env_keys({"G1_PING_IP": "192.168.51.115"})
+    assert not svc._env_changed_outside()
