@@ -1236,7 +1236,10 @@ class RelayTransport(RobotTransport):
     def __init__(self, robot: str, url: str, token: str, dry_run: bool, udp_port: int = 0):
         self._robot = robot
         self.VERB_FOR_SKILL = self.VERB_FOR_SKILL_BY_ROBOT[robot]
-        self._url = url.rstrip("/") + "/cmd"
+        self._base_url = url.rstrip("/")
+        self._url = self._base_url + "/cmd"
+        self._identity = None
+        self._identity_at = -1e9
         self._token = token
         self._dry_run = dry_run
         self._move_lock = threading.Lock()
@@ -1253,6 +1256,32 @@ class RelayTransport(RobotTransport):
             self._udp = _RelayUdp(host, udp_port, token.encode())
         via = f"UDP :{udp_port} for move/stop, HTTP for the rest" if self._udp else "HTTP"
         print(f"[executor] {robot}: RELAY transport -> {self._url} ({via})", flush=True)
+
+    # How long a relay's answer to "which robot are you" is trusted before asking again.
+    _IDENTITY_TTL_S = 10.0
+
+    def _identity_error(self):
+        """None if the relay at this URL belongs to THIS robot (or cannot say), else why not.
+
+        WHY: the URL is per robot and set from the Robot page, and on 2026-10-07 the G1's ended
+        up pointing at the Go2's relay — so a command for the humanoid would have been carried
+        out by the dog (move, damp and stop_move mean something to both). The relay reports
+        its own robot_model in /health; checking it makes that mistake refuse loudly instead
+        of moving the wrong robot. An older relay that does not report it is let through: the
+        check must never lock out a robot that is configured correctly."""
+        if self._dry_run:
+            return None
+        now = time.monotonic()
+        if now - self._identity_at > self._IDENTITY_TTL_S:
+            reported = _relay_health(self._base_url).get("robot_model")
+            if reported:                      # an unreachable relay keeps the last answer
+                self._identity = str(reported).strip().lower()
+                self._identity_at = now
+        if self._identity and self._identity != self._robot:
+            return (f"refused: {self._base_url} is the {self._identity}'s relay, not the "
+                    f"{self._robot}'s — fix {self._robot.upper()}_RELAY_URL in Robot → "
+                    f"Connection")
+        return None
 
     def _next_ts(self) -> float:
         """This machine's clock, forced strictly increasing: the relay orders every movement
@@ -1391,6 +1420,10 @@ class RelayTransport(RobotTransport):
 
         if kind == "unsupported":
             return {"ok": False, "detail": intent["reason"]}
+
+        wrong = self._identity_error()
+        if wrong:
+            return {"ok": False, "detail": wrong}
 
         if kind == "stop":
             with self._move_lock:
