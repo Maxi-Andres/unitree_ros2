@@ -42,6 +42,9 @@ Endpoints:
                               -> retune the robot's live view WITHOUT restarting anything;
                                  persist=true also writes the robot's video.env. Proxied to
                                  the on-robot relay, which owns the allowlist and ranges.
+    GET  /joints/stream?robot=g1 -> the G1's joint state, one JSON line per tick, streamed
+                                 from the on-robot relay until the caller hangs up. Read-only;
+                                 always through the relay, whatever the command transport.
 """
 import hashlib
 import hmac
@@ -269,20 +272,19 @@ def _relay_for(robot: str):
     The URL and the token already live here because this process is the one that talks to
     the relay. Threading video config through the same place keeps the secret in one
     process instead of copying it into another.
+
+    The token is the robot's OWN when it has one (_relay_token, the same lookup the command
+    path uses). Until 2026-10-13 this read only the shared RELAY_TOKEN, so every call made
+    here for the G1 — which has G1_RELAY_TOKEN — carried the Go2's token and got 401.
     """
     prefix = robot.upper()
     url = os.environ.get(f"{prefix}_RELAY_URL", "").strip()
     if not url:
         return None, f"{prefix}_RELAY_URL is unset — this robot has no relay configured"
-    token = os.environ.get("RELAY_TOKEN", "").strip()
+    token = _relay_token(robot)
     if not token:
-        token_file = os.environ.get("RELAY_TOKEN_FILE",
-                                    os.path.expanduser("~/.relay_token"))
-        if os.path.exists(token_file):
-            with open(token_file, encoding="utf-8") as f:
-                token = f.read().strip()
-    if not token:
-        return None, "no relay token: set RELAY_TOKEN or ~/.relay_token"
+        return None, (f"no relay token: set {prefix}_RELAY_TOKEN, RELAY_TOKEN or "
+                      f"~/.relay_token")
     return (url.rstrip("/"), token), None
 
 
@@ -320,6 +322,35 @@ def _relay_video(robot: str, body=None) -> dict:
         return body
     except Exception as exc:
         return {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _open_joint_stream(robot: str):
+    """(response, 200, None) streaming the relay's GET /joints/stream, or
+    (None, http status, error dict).
+
+    Read-only. ALWAYS through the relay, whatever the robot's command transport: the joint
+    state comes from g1_joint_bridge on PC2, and DDS from this machine only works while the
+    robot shares its subnet. The token stays here, like every other relay call.
+    """
+    if robot != "g1":
+        return None, 400, {"ok": False,
+                           "error": f"no joint stream for robot '{robot}' (G1 only)"}
+    got, err = _relay_for(robot)
+    if err:
+        return None, 503, {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(url + "/joints/stream",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        # The timeout bounds the connect AND every read. The relay sends a line at least once
+        # per second (a {"stale": true} heartbeat when nothing new arrives), so a read that
+        # waits 5 s means the link or the relay is gone, not that the robot is still.
+        return urllib.request.urlopen(req, timeout=5), 200, None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        return None, 502, {"ok": False, "error": f"relay answered HTTP {exc.code}: {detail}"}
+    except Exception as exc:
+        return None, 502, {"ok": False, "error": f"relay unreachable: {exc}"}
 
 
 def _transport_config() -> dict:
@@ -1714,8 +1745,36 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             pass
         threading.Thread(target=_restart_self, daemon=True).start()
 
+    def _handle_joint_stream(self, robot):
+        """GET /joints/stream?robot=g1 — the relay's joint state, passed through line by
+        line until either side hangs up. Errors BEFORE the first line are JSON with a status,
+        like every other route; after that the only way to report one is to stop."""
+        upstream, status, err = _open_joint_stream(robot)
+        if err:
+            self._send(status, err)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            for line in upstream:
+                self.wfile.write(line)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                        # either side hung up; closing upstream frees the relay
+        finally:
+            upstream.close()
+
     def do_GET(self):
         path = self.path.rstrip("/")
+        if path.split("?")[0].rstrip("/") == "/joints/stream":
+            from urllib.parse import parse_qs, urlparse
+            robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
+                     or "g1").strip().lower()
+            self._handle_joint_stream(robot)
+            return
         if path == "/transport":
             self._send(200, {"ok": True, "transports": _transport_config()})
             return
