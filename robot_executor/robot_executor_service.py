@@ -49,6 +49,10 @@ Endpoints:
     GET  /joints/stream?robot=g1 -> the G1's joint state, one JSON line per tick, streamed
                                  from the on-robot relay until the caller hangs up. Read-only;
                                  always through the relay, whatever the command transport.
+    POST /joints/control?robot=g1 {op, session?, joint?, q?}
+                              -> take / target / keepalive / status / release: move single arm
+                                 joints from the Joints page. Proxied to the relay, whose
+                                 g1_joint_sender owns every limit. Refused under DRY_RUN.
 """
 import hashlib
 import hmac
@@ -387,6 +391,44 @@ def _open_joint_stream(robot: str):
         return None, 502, {"ok": False, "error": f"relay answered HTTP {exc.code}: {detail}"}
     except Exception as exc:
         return None, 502, {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _relay_joint_control(robot: str, body: dict) -> tuple:
+    """(http status, dict) from the relay's POST /joints/control — a proxy, like _relay_audio.
+
+    The limits (which joints, how far, how fast, the dead-man) are in g1_joint_sender on the
+    robot; this adds only the token, so it never reaches the browser. The relay's status is
+    passed through: a refused `take` is a 409 here too, not a success with an error inside.
+
+    DRY_RUN refuses everything but `release`: a dry-run executor must not move the robot, and
+    refusing a release could only ever leave an arm held.
+    """
+    if robot != "g1":
+        return 400, {"ok": False, "error": f"no joint control for robot '{robot}' (G1 only)"}
+    if DRY_RUN and body.get("op") != "release":
+        return 409, {"ok": False, "error": "the executor is in DRY_RUN: no joint control"}
+    got, err = _relay_for(robot)
+    if err:
+        return 503, {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(
+        url + "/joints/control", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        # `take` waits for the sender to join DDS and read the robot once (~1.5 s, up to 6).
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        try:
+            out = json.loads(detail)
+        except ValueError:
+            out = {"error": f"HTTP {exc.code}: {detail}"}
+        out.setdefault("error", f"HTTP {exc.code}")
+        out["ok"] = False
+        return exc.code, out
+    except Exception as exc:
+        return 502, {"ok": False, "error": f"relay unreachable: {exc}"}
 
 
 def _transport_config() -> dict:
@@ -1890,6 +1932,22 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         # Before the JSON parse below: /audio/say carries a WAV, not JSON.
         if path.split("?")[0].rstrip("/") in ("/audio/say", "/audio/stop", "/audio/volume"):
             self._handle_audio("POST")
+            return
+        if path.split("?")[0].rstrip("/") == "/joints/control":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self._send(400, {"ok": False, "error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                self._send(400, {"ok": False, "error": "invalid JSON body"})
+                return
+            from urllib.parse import parse_qs, urlparse
+            robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
+                     or "g1").strip().lower()
+            code, out = _relay_joint_control(robot, body)
+            self._send(code, out)
             return
         if path not in ("/execute", "/dds", "/transport", "/video"):
             self._send(404, {"ok": False, "error": "not found"})
