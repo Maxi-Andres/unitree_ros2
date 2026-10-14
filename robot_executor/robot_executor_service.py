@@ -42,6 +42,10 @@ Endpoints:
                               -> retune the robot's live view WITHOUT restarting anything;
                                  persist=true also writes the robot's video.env. Proxied to
                                  the on-robot relay, which owns the allowlist and ranges.
+    POST /audio/say?robot=go2    body: a WAV -> {ok, seconds}: the robot's own speaker plays it
+    POST /audio/stop?robot=go2   -> {ok}
+    GET  /audio/volume?robot=go2 -> {ok, volume}     POST same, {"level": 0-10} -> {ok, volume}
+                              Proxied to the on-robot relay, which validates the WAV and level.
     GET  /joints/stream?robot=g1 -> the G1's joint state, one JSON line per tick, streamed
                                  from the on-robot relay until the caller hangs up. Read-only;
                                  always through the relay, whatever the command transport.
@@ -322,6 +326,38 @@ def _relay_video(robot: str, body=None) -> dict:
         return body
     except Exception as exc:
         return {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _relay_audio(robot: str, method: str, path: str, body: bytes = b"",
+                 ctype: str = "application/json") -> tuple:
+    """(http status, dict) from the relay's /audio/* — a proxy, like _relay_video.
+
+    The relay validates the WAV and the volume level; repeating that here would be a second
+    source of truth for the same contract. Its status code is passed through, so a refused
+    WAV is a 400 here too and not a success with an error inside.
+    """
+    got, err = _relay_for(robot)
+    if err:
+        return 503, {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(
+        url + path, data=body if method == "POST" else None, method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": ctype})
+    try:
+        # Long enough for the relay to upload a 30 s phrase to the speaker (~3 s).
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        try:
+            out = json.loads(detail)
+        except ValueError:
+            out = {"error": f"HTTP {exc.code}: {detail}"}
+        out.setdefault("error", f"HTTP {exc.code}")
+        out["ok"] = False
+        return exc.code, out
+    except Exception as exc:
+        return 502, {"ok": False, "error": f"relay unreachable: {exc}"}
 
 
 def _open_joint_stream(robot: str):
@@ -1767,8 +1803,24 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         finally:
             upstream.close()
 
+    def _audio_robot(self):
+        from urllib.parse import parse_qs, urlparse
+        return (parse_qs(urlparse(self.path).query).get("robot", [DEFAULT_ROBOT])[0]
+                or DEFAULT_ROBOT).strip().lower()
+
+    def _handle_audio(self, method):
+        route = self.path.split("?")[0].rstrip("/")
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b""
+        code, out = _relay_audio(self._audio_robot(), method, route, body,
+                                 self.headers.get("Content-Type", "application/json"))
+        self._send(code, {"robot": self._audio_robot(), **out})
+
     def do_GET(self):
         path = self.path.rstrip("/")
+        if path.split("?")[0].rstrip("/") == "/audio/volume":
+            self._handle_audio("GET")
+            return
         if path.split("?")[0].rstrip("/") == "/joints/stream":
             from urllib.parse import parse_qs, urlparse
             robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
@@ -1835,6 +1887,10 @@ class ExecutorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.rstrip("/")
+        # Before the JSON parse below: /audio/say carries a WAV, not JSON.
+        if path.split("?")[0].rstrip("/") in ("/audio/say", "/audio/stop", "/audio/volume"):
+            self._handle_audio("POST")
+            return
         if path not in ("/execute", "/dds", "/transport", "/video"):
             self._send(404, {"ok": False, "error": "not found"})
             return
