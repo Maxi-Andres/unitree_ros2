@@ -46,6 +46,8 @@ Endpoints:
     POST /audio/stop?robot=go2   -> {ok}
     GET  /audio/volume?robot=go2 -> {ok, volume}     POST same, {"level": 0-10} -> {ok, volume}
                               Proxied to the on-robot relay, which validates the WAV and level.
+    GET  /audio/mic/stream?robot=g1 -> the G1's own microphone, raw 16 kHz s16le, streamed;
+                                 the robot's mic is on while this is open
     GET  /joints/stream?robot=g1 -> the G1's joint state, one JSON line per tick, streamed
                                  from the on-robot relay until the caller hangs up. Read-only;
                                  always through the relay, whatever the command transport.
@@ -385,6 +387,32 @@ def _open_joint_stream(robot: str):
         # The timeout bounds the connect AND every read. The relay sends a line at least once
         # per second (a {"stale": true} heartbeat when nothing new arrives), so a read that
         # waits 5 s means the link or the relay is gone, not that the robot is still.
+        return urllib.request.urlopen(req, timeout=5), 200, None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        return None, 502, {"ok": False, "error": f"relay answered HTTP {exc.code}: {detail}"}
+    except Exception as exc:
+        return None, 502, {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _open_mic_stream(robot: str):
+    """(response, 200, None) streaming the relay's GET /audio/mic/stream, or
+    (None, http status, error dict). G1 only: the Go2's mic is reachable only over WebRTC.
+
+    The relay switches the robot's mic on for as long as this stays open and off when it
+    closes, so closing it is how the app's switch turns the mic off.
+    """
+    if robot != "g1":
+        return None, 400, {"ok": False, "error": f"no microphone for robot '{robot}' (G1 only)"}
+    got, err = _relay_for(robot)
+    if err:
+        return None, 503, {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(url + "/audio/mic/stream",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        # The robot sends a packet every 160 ms while the mic is on: a read that waits 5 s
+        # means the link or the relay is gone.
         return urllib.request.urlopen(req, timeout=5), 200, None
     except urllib.error.HTTPError as exc:
         detail = exc.read()[:300].decode("utf-8", "replace")
@@ -1845,6 +1873,30 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         finally:
             upstream.close()
 
+    def _handle_mic_stream(self, robot):
+        """GET /audio/mic/stream?robot=g1 — the relay's mic stream, passed through chunk by
+        chunk until either side hangs up (which also switches the robot's mic off)."""
+        upstream, status, err = _open_mic_stream(robot)
+        if err:
+            self._send(status, err)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/L16;rate=16000;channels=1")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            while True:
+                chunk = upstream.read1(65536) if hasattr(upstream, "read1") else upstream.read(5120)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                        # either side hung up; closing upstream frees the relay
+        finally:
+            upstream.close()
+
     def _audio_robot(self):
         from urllib.parse import parse_qs, urlparse
         return (parse_qs(urlparse(self.path).query).get("robot", [DEFAULT_ROBOT])[0]
@@ -1862,6 +1914,9 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         if path.split("?")[0].rstrip("/") == "/audio/volume":
             self._handle_audio("GET")
+            return
+        if path.split("?")[0].rstrip("/") == "/audio/mic/stream":
+            self._handle_mic_stream(self._audio_robot())
             return
         if path.split("?")[0].rstrip("/") == "/joints/stream":
             from urllib.parse import parse_qs, urlparse
