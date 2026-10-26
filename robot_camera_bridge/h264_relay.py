@@ -298,9 +298,10 @@ class H264Relay:
     # A lease with no heartbeat for this long is dead even if the socket has not noticed.
     _LEASE_SILENT_S = 5.0
 
-    def __init__(self, robot_url, backend_url, logger=None, udp_port=0):
+    def __init__(self, robot_url, backend_url, logger=None, udp_port=0, headers=None):
         self._url = robot_url
         self._backend = backend_url
+        self._headers = list(headers or [])   # the gateway's device key, see the bridge
         self._log = logger
         self._udp_port = udp_port
         self._tcp_until = 0.0
@@ -377,7 +378,7 @@ class H264Relay:
         try:
             self._ws = websocket.create_connection(
                 self._backend, sslopt={"cert_reqs": ssl.CERT_NONE}, timeout=5,
-                enable_multithread=True)
+                header=self._headers, enable_multithread=True)
         except Exception as exc:
             # Name the END that failed. This relay has two, and a message that blames the
             # robot for the backend's refusal sends the next person to the wrong machine —

@@ -91,6 +91,30 @@ H264_URL_BY_ROBOT = {r: os.environ.get(f"{r.upper()}_H264_URL", "") for r in ("g
 def h264_url_for(robot):
     return H264_URL_BY_ROBOT.get(robot) or H264_URL
 H264_WS_URL = os.environ.get("H264_WS_URL", "wss://localhost:8443/ws/robot-h264")
+
+
+def _device_key():
+    """The gateway refuses the video without a device key (auth.POLICY: /ws/robot-cam and
+    /ws/robot-h264 need "ingest"). Created once on the server with
+    `pilot_admin.py device-key create "camera bridge"`. PILOT_DEVICE_KEY wins; otherwise the
+    file PILOT_DEVICE_KEY_FILE (default ~/.pilot/device-key). Never printed (standard §2)."""
+    key = os.environ.get("PILOT_DEVICE_KEY", "").strip()
+    if not key:
+        path = os.path.expanduser(os.environ.get("PILOT_DEVICE_KEY_FILE", "~/.pilot/device-key"))
+        try:
+            with open(path) as f:
+                key = f.read().strip()
+        except OSError:
+            key = ""
+    if not key:
+        print("[camera] no device key (PILOT_DEVICE_KEY or ~/.pilot/device-key): the gateway "
+              "will refuse the video with close code 4401", flush=True)
+    return key
+
+
+DEVICE_KEY = _device_key()
+# Sent on both WebSocket handshakes into the gateway (JPEG and H.264).
+BACKEND_HEADERS = [f"Authorization: Bearer {DEVICE_KEY}"] if DEVICE_KEY else []
 # Carry the robot -> HQ hop of the drive branch over UDP on this port. Empty or 0 = TCP, the
 # default. Anything that is not a port in 1024-65535 also means TCP: a typo must cost the
 # improvement, never the picture. Why UDP, and what was measured: h264_relay.py.
@@ -192,7 +216,7 @@ class CameraBridge:
         try:
             self._ws = websocket.create_connection(
                 BACKEND_WS_URL, sslopt={"cert_reqs": ssl.CERT_NONE}, timeout=5,
-                enable_multithread=True)
+                header=BACKEND_HEADERS, enable_multithread=True)
             # IMPORTANT: create_connection's timeout also becomes the socket's recv
             # timeout. Clear it (blocking) so the reader's recv() blocks indefinitely
             # instead of dying after 5 s of idle — otherwise it stops answering the
@@ -327,7 +351,8 @@ def main():
     relay = None
     if h264_url_for(ROBOT):
         relay = h264_relay.H264Relay(h264_url_for(ROBOT), H264_WS_URL,
-                                     logger=node.get_logger(), udp_port=H264_UDP_PORT)
+                                     logger=node.get_logger(), udp_port=H264_UDP_PORT,
+                                     headers=BACKEND_HEADERS)
     try:
         mgr = SourceManager(node, bridge.on_frame, SOURCE_CFG, ROBOT, relay=relay)
     except Exception as e:
