@@ -125,3 +125,18 @@ def test_the_executors_own_write_is_not_a_hand_edit(tmp_path, monkeypatch):
     svc._ENV_SEEN["mtime"] = svc._env_mtime()
     svc._set_env_keys({"G1_PING_IP": "192.168.51.115"})
     assert not svc._env_changed_outside()
+
+
+@pytest.mark.parametrize("url", [
+    "http://10.0.0.5:8092\nG1_RELAY_TOKEN=mine",
+    "http://10.0.0.5:8092\rX=1",
+    "http://10.0.0.5 :8092",
+    "http://",
+])
+def test_a_relay_url_is_one_address_and_nothing_more(env, url):
+    """Catches: a newline in the URL writing .env keys of the sender's choosing."""
+    f, restarts = env
+    before = f.read_text()
+    code, _ = call({"robot": "g1", "url": url})
+    assert code == 400
+    assert f.read_text() == before and restarts == []

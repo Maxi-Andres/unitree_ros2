@@ -1809,6 +1809,13 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False,
                                  "error": "'url' must start with http:// or https://"})
                 return
+            # One line of .env: a newline in it would write keys of the sender's choosing
+            # (found 2026-10-28, reviewing Pilot once it was on the internet).
+            if url and (any(c.isspace() or ord(c) < 32 for c in url)
+                        or not urllib.parse.urlsplit(url).hostname):
+                self._send(400, {"ok": False,
+                                 "error": "'url' must be one address, e.g. http://10.1.254.18:8092"})
+                return
             if not url and mode == "relay":
                 self._send(400, {"ok": False,
                                  "error": "cannot clear the relay URL while mode is "
