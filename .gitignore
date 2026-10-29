@@ -6,3 +6,8 @@
 .cache/
 **/.env
 **/.streaming
+
+# Written at runtime by the executor (POST /dds) from the AI-VL page: each network change
+# from the UI dirtied the repo. dds.env.example is the template; without the file the
+# executor and setup.sh use the same defaults it ships with.
+dds.env
