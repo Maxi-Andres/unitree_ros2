@@ -102,6 +102,12 @@ def test_volume_is_read_and_set_through_the_relay(relay, executor):
                                   b'{"level": 3}')
 
 
+def test_head_led_goes_through_the_relay(relay, executor):
+    _call(executor, "POST", "/audio/led?robot=go2", b'{"r": 255, "g": 0, "b": 0}')
+    assert relay.seen[-1][1:] == ("/audio/led", f"Bearer {TOKEN}", "application/json",
+                                  b'{"r": 255, "g": 0, "b": 0}')
+
+
 def test_a_robot_without_a_relay_says_so(monkeypatch, executor):
     monkeypatch.delenv("G1_RELAY_URL", raising=False)
     code, out = _call(executor, "POST", "/audio/stop?robot=g1", b"")

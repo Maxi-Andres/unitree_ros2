@@ -45,6 +45,7 @@ Endpoints:
     POST /audio/say?robot=go2    body: a WAV -> {ok, seconds}: the robot's own speaker plays it
     POST /audio/stop?robot=go2   -> {ok}
     GET  /audio/volume?robot=go2 -> {ok, volume}     POST same, {"level": 0-10} -> {ok, volume}
+    POST /audio/led?robot=g1     {"r", "g", "b": 0-255} -> {ok}: the G1's head LED
                               Proxied to the on-robot relay, which validates the WAV and level.
     GET  /audio/mic/stream?robot=g1 -> the G1's own microphone, raw 16 kHz s16le, streamed;
                                  the robot's mic is on while this is open
@@ -1992,7 +1993,8 @@ class ExecutorHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.rstrip("/")
         # Before the JSON parse below: /audio/say carries a WAV, not JSON.
-        if path.split("?")[0].rstrip("/") in ("/audio/say", "/audio/stop", "/audio/volume"):
+        if path.split("?")[0].rstrip("/") in ("/audio/say", "/audio/stop", "/audio/volume",
+                                             "/audio/led"):
             self._handle_audio("POST")
             return
         if path.split("?")[0].rstrip("/") == "/joints/control":
