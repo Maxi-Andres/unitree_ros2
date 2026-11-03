@@ -49,6 +49,9 @@ Endpoints:
                               Proxied to the on-robot relay, which validates the WAV and level.
     GET  /audio/mic/stream?robot=g1 -> the G1's own microphone, raw 16 kHz s16le, streamed;
                                  the robot's mic is on while this is open
+    GET  /camera/depth?robot=g1&frames=N -> one depth picture, a 16-bit PNG in millimetres
+                                 (facts in X-Depth-Info), for measuring where a thing is;
+                                 off on the Go2 by the robot's own DEPTH_SNAPSHOT
     GET  /joints/stream?robot=g1 -> the G1's joint state, one JSON line per tick, streamed
                                  from the on-robot relay until the caller hangs up. Read-only;
                                  always through the relay, whatever the command transport.
@@ -420,6 +423,37 @@ def _open_mic_stream(robot: str):
         return None, 502, {"ok": False, "error": f"relay answered HTTP {exc.code}: {detail}"}
     except Exception as exc:
         return None, 502, {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _relay_depth(robot: str, frames: str) -> tuple:
+    """(png bytes, info header, 200) from the relay's GET /camera/depth, or
+    (None, error dict, http status).
+
+    The relay bounds `frames` and the robot decides whether snapshots exist at all; both of
+    their refusals are passed through with their status. Only the token is added here.
+    """
+    got, err = _relay_for(robot)
+    if err:
+        return None, {"ok": False, "error": err}, 503
+    url, token = got
+    from urllib.parse import quote
+    req = urllib.request.Request(f"{url}/camera/depth?frames={quote(frames)}",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        # The relay waits up to 8 s for camera_source to median its frames.
+        with urllib.request.urlopen(req, timeout=12) as r:
+            return r.read(), r.headers.get("X-Depth-Info", "{}"), 200
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        try:
+            out = json.loads(detail)
+        except ValueError:
+            out = {"error": f"HTTP {exc.code}: {detail}"}
+        out.setdefault("error", f"HTTP {exc.code}")
+        out["ok"] = False
+        return None, out, exc.code
+    except Exception as exc:
+        return None, {"ok": False, "error": f"relay unreachable: {exc}"}, 502
 
 
 def _relay_joint_control(robot: str, body: dict) -> tuple:
@@ -1905,6 +1939,24 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         finally:
             upstream.close()
 
+    def _handle_depth(self):
+        """GET /camera/depth?robot=g1&frames=N — the relay's depth snapshot, PNG and all."""
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(self.path).query)
+        robot = (q.get("robot", ["g1"])[0] or "g1").strip().lower()
+        png, info, code = _relay_depth(robot, q.get("frames", ["5"])[0])
+        if png is None:
+            self._send(code, {"robot": robot, **info})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("X-Depth-Info", info)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "X-Depth-Info")
+        self.send_header("Content-Length", str(len(png)))
+        self.end_headers()
+        self.wfile.write(png)
+
     def _audio_robot(self):
         from urllib.parse import parse_qs, urlparse
         return (parse_qs(urlparse(self.path).query).get("robot", [DEFAULT_ROBOT])[0]
@@ -1925,6 +1977,9 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             return
         if path.split("?")[0].rstrip("/") == "/audio/mic/stream":
             self._handle_mic_stream(self._audio_robot())
+            return
+        if path.split("?")[0].rstrip("/") == "/camera/depth":
+            self._handle_depth()
             return
         if path.split("?")[0].rstrip("/") == "/joints/stream":
             from urllib.parse import parse_qs, urlparse
