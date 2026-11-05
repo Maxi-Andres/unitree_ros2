@@ -125,3 +125,8 @@ def test_the_lidar_stream_passes_through(relay, executor):
     code, raw = _req(executor, "GET", "/lidar/stream?robot=g1")
     assert code == 200 and len(raw.splitlines()) == 3
     assert relay.seen[0][:2] == ("/lidar/stream", f"Bearer {TOKEN}")
+
+
+def test_the_lidar_cloud_passes_through(relay, executor):
+    code, _raw = _req(executor, "GET", "/lidar/cloud?robot=g1")
+    assert code == 200 and relay.seen[0][0] == "/lidar/cloud"
