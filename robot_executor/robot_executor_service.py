@@ -59,6 +59,11 @@ Endpoints:
                               -> take / target / keepalive / status / release: move single arm
                                  joints from the Joints page. Proxied to the relay, whose
                                  g1_joint_sender owns every limit. Refused under DRY_RUN.
+    GET  /odom/stream?robot=g1 -> where the G1 thinks it is (its own odometry), one JSON line
+                                 per tick from the relay's g1_odom_bridge. Read-only.
+    POST /walk/control?robot=g1 {op: goto, dx, dy, dyaw} | {op: cancel} | {op: status}
+                              -> walk to a pose relative to where it stands; the loop runs ON
+                                 THE ROBOT (relay_server.Walk). goto refused under DRY_RUN.
 """
 import hashlib
 import hmac
@@ -370,9 +375,9 @@ def _relay_audio(robot: str, method: str, path: str, body: bytes = b"",
         return 502, {"ok": False, "error": f"relay unreachable: {exc}"}
 
 
-def _open_joint_stream(robot: str):
-    """(response, 200, None) streaming the relay's GET /joints/stream, or
-    (None, http status, error dict).
+def _open_joint_stream(robot: str, route: str = "/joints/stream", what: str = "joint stream"):
+    """(response, 200, None) streaming the relay's GET /joints/stream (or, with `route`, its
+    GET /odom/stream: the same NDJSON shape), or (None, http status, error dict).
 
     Read-only. ALWAYS through the relay, whatever the robot's command transport: the joint
     state comes from g1_joint_bridge on PC2, and DDS from this machine only works while the
@@ -380,12 +385,12 @@ def _open_joint_stream(robot: str):
     """
     if robot != "g1":
         return None, 400, {"ok": False,
-                           "error": f"no joint stream for robot '{robot}' (G1 only)"}
+                           "error": f"no {what} for robot '{robot}' (G1 only)"}
     got, err = _relay_for(robot)
     if err:
         return None, 503, {"ok": False, "error": err}
     url, token = got
-    req = urllib.request.Request(url + "/joints/stream",
+    req = urllib.request.Request(url + route,
                                  headers={"Authorization": f"Bearer {token}"})
     try:
         # The timeout bounds the connect AND every read. The relay sends a line at least once
@@ -480,6 +485,38 @@ def _relay_joint_control(robot: str, body: dict) -> tuple:
     try:
         # `take` waits for the sender to join DDS and read the robot once (~1.5 s, up to 6).
         with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        try:
+            out = json.loads(detail)
+        except ValueError:
+            out = {"error": f"HTTP {exc.code}: {detail}"}
+        out.setdefault("error", f"HTTP {exc.code}")
+        out["ok"] = False
+        return exc.code, out
+    except Exception as exc:
+        return 502, {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _relay_walk_control(robot: str, body: dict) -> tuple:
+    """(http status, dict) from the relay's POST /walk/control: the G1 walks to a pose relative
+    to where it stands, the loop closed on its odometry ON THE ROBOT (relay_server.Walk). A
+    proxy: only the token is added. DRY_RUN refuses `goto` (status and cancel still pass: a
+    refused cancel could only leave the robot walking)."""
+    if robot != "g1":
+        return 400, {"ok": False, "error": f"no walk to a point for robot '{robot}' (G1 only)"}
+    if DRY_RUN and body.get("op") == "goto":
+        return 409, {"ok": False, "error": "the executor is in DRY_RUN: no walking"}
+    got, err = _relay_for(robot)
+    if err:
+        return 503, {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(
+        url + "/walk/control", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as exc:
         detail = exc.read()[:300].decode("utf-8", "replace")
@@ -1893,11 +1930,11 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             pass
         threading.Thread(target=_restart_self, daemon=True).start()
 
-    def _handle_joint_stream(self, robot):
-        """GET /joints/stream?robot=g1 — the relay's joint state, passed through line by
-        line until either side hangs up. Errors BEFORE the first line are JSON with a status,
-        like every other route; after that the only way to report one is to stop."""
-        upstream, status, err = _open_joint_stream(robot)
+    def _handle_joint_stream(self, robot, route="/joints/stream", what="joint stream"):
+        """GET /joints/stream?robot=g1 (and /odom/stream) — the relay's stream, passed through
+        line by line until either side hangs up. Errors BEFORE the first line are JSON with a
+        status, like every other route; after that the only way to report one is to stop."""
+        upstream, status, err = _open_joint_stream(robot, route, what)
         if err:
             self._send(status, err)
             return
@@ -1987,6 +2024,12 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                      or "g1").strip().lower()
             self._handle_joint_stream(robot)
             return
+        if path.split("?")[0].rstrip("/") == "/odom/stream":
+            from urllib.parse import parse_qs, urlparse
+            robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
+                     or "g1").strip().lower()
+            self._handle_joint_stream(robot, "/odom/stream", "odometry stream")
+            return
         if path == "/transport":
             self._send(200, {"ok": True, "transports": _transport_config()})
             return
@@ -2052,7 +2095,7 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                                              "/audio/led"):
             self._handle_audio("POST")
             return
-        if path.split("?")[0].rstrip("/") == "/joints/control":
+        if path.split("?")[0].rstrip("/") in ("/joints/control", "/walk/control"):
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -2065,7 +2108,10 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
                      or "g1").strip().lower()
-            code, out = _relay_joint_control(robot, body)
+            if path.split("?")[0].rstrip("/") == "/walk/control":
+                code, out = _relay_walk_control(robot, body)
+            else:
+                code, out = _relay_joint_control(robot, body)
             self._send(code, out)
             return
         if path not in ("/execute", "/dds", "/transport", "/video"):
