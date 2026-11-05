@@ -61,6 +61,8 @@ Endpoints:
                                  g1_joint_sender owns every limit. Refused under DRY_RUN.
     GET  /odom/stream?robot=g1 -> where the G1 thinks it is (its own odometry), one JSON line
                                  per tick from the relay's g1_odom_bridge. Read-only.
+    GET  /lidar/stream?robot=g1 -> the obstacle map around the G1 from its Mid-360 (the relay's
+                                 g1_lidar_bridge, coarsened for the page). Read-only.
     POST /walk/control?robot=g1 {op: goto, dx, dy, dyaw} | {op: cancel} | {op: status}
                               -> walk to a pose relative to where it stands; the loop runs ON
                                  THE ROBOT (relay_server.Walk). goto refused under DRY_RUN.
@@ -2029,6 +2031,12 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
                      or "g1").strip().lower()
             self._handle_joint_stream(robot, "/odom/stream", "odometry stream")
+            return
+        if path.split("?")[0].rstrip("/") == "/lidar/stream":
+            from urllib.parse import parse_qs, urlparse
+            robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
+                     or "g1").strip().lower()
+            self._handle_joint_stream(robot, "/lidar/stream", "lidar stream")
             return
         if path == "/transport":
             self._send(200, {"ok": True, "transports": _transport_config()})

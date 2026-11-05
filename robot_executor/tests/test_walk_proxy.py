@@ -119,3 +119,9 @@ def test_the_odometry_stream_passes_through(relay, executor):
     assert code == 200
     assert [json.loads(ln)["x"] for ln in raw.splitlines()] == [0, 1, 2]
     assert relay.seen[0][:2] == ("/odom/stream", f"Bearer {TOKEN}")
+
+
+def test_the_lidar_stream_passes_through(relay, executor):
+    code, raw = _req(executor, "GET", "/lidar/stream?robot=g1")
+    assert code == 200 and len(raw.splitlines()) == 3
+    assert relay.seen[0][:2] == ("/lidar/stream", f"Bearer {TOKEN}")
