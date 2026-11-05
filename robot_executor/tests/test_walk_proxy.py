@@ -31,6 +31,13 @@ class FakeRelay(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.seen.append((self.path, self.headers.get("Authorization"), None))
+        if self.path == "/odom/trail":
+            data = json.dumps({"ok": True, "points": [[0, 0, 0, 1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
@@ -130,3 +137,10 @@ def test_the_lidar_stream_passes_through(relay, executor):
 def test_the_lidar_cloud_passes_through(relay, executor):
     code, _raw = _req(executor, "GET", "/lidar/cloud?robot=g1")
     assert code == 200 and relay.seen[0][0] == "/lidar/cloud"
+
+
+def test_the_trail_is_read_and_cleared_through_the_relay(relay, executor):
+    code, raw = _req(executor, "GET", "/odom/trail?robot=g1")
+    assert code == 200 and json.loads(raw)["points"] == [[0, 0, 0, 1]]
+    code, _raw = _req(executor, "POST", "/odom/trail?robot=g1", {})
+    assert code == 200 and relay.seen[-1][:2] == ("/odom/trail", f"Bearer {TOKEN}")

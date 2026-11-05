@@ -63,6 +63,7 @@ Endpoints:
                                  per tick from the relay's g1_odom_bridge. Read-only.
     GET  /lidar/stream?robot=g1 -> the obstacle map around the G1 from its Mid-360 (the relay's
                                  g1_lidar_bridge, coarsened for the page). Read-only.
+    GET  /odom/trail?robot=g1  -> where the G1 walked, recorded on the robot; POST clears it.
     GET  /lidar/cloud?robot=g1 -> the 3D point cloud around it, ~1 Hz (base64 int16 cm). Read-only.
     POST /walk/control?robot=g1 {op: goto, dx, dy, dyaw} | {op: cancel} | {op: status}
                               -> walk to a pose relative to where it stands; the loop runs ON
@@ -517,6 +518,35 @@ def _relay_walk_control(robot: str, body: dict) -> tuple:
     url, token = got
     req = urllib.request.Request(
         url + "/walk/control", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        try:
+            out = json.loads(detail)
+        except ValueError:
+            out = {"error": f"HTTP {exc.code}: {detail}"}
+        out.setdefault("error", f"HTTP {exc.code}")
+        out["ok"] = False
+        return exc.code, out
+    except Exception as exc:
+        return 502, {"ok": False, "error": f"relay unreachable: {exc}"}
+
+
+def _relay_odom_trail(robot: str, method: str) -> tuple:
+    """(http status, dict) from the relay's GET/POST /odom/trail: where the G1 walked, recorded on
+    the robot. A proxy: only the token is added."""
+    if robot != "g1":
+        return 400, {"ok": False, "error": f"no trail for robot '{robot}' (G1 only)"}
+    got, err = _relay_for(robot)
+    if err:
+        return 503, {"ok": False, "error": err}
+    url, token = got
+    req = urllib.request.Request(
+        url + "/odom/trail", method=method,
+        data=json.dumps({"op": "clear"}).encode() if method == "POST" else None,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -2039,6 +2069,12 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                      or "g1").strip().lower()
             self._handle_joint_stream(robot, "/lidar/stream", "lidar stream")
             return
+        if path.split("?")[0].rstrip("/") == "/odom/trail":
+            from urllib.parse import parse_qs, urlparse
+            robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
+                     or "g1").strip().lower()
+            self._send(*_relay_odom_trail(robot, "GET"))
+            return
         if path.split("?")[0].rstrip("/") == "/lidar/cloud":
             from urllib.parse import parse_qs, urlparse
             robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
@@ -2109,6 +2145,12 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         if path.split("?")[0].rstrip("/") in ("/audio/say", "/audio/stop", "/audio/volume",
                                              "/audio/led"):
             self._handle_audio("POST")
+            return
+        if path.split("?")[0].rstrip("/") == "/odom/trail":
+            from urllib.parse import parse_qs, urlparse
+            robot = (parse_qs(urlparse(self.path).query).get("robot", ["g1"])[0]
+                     or "g1").strip().lower()
+            self._send(*_relay_odom_trail(robot, "POST"))
             return
         if path.split("?")[0].rstrip("/") in ("/joints/control", "/walk/control"):
             try:
