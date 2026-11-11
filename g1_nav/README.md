@@ -64,4 +64,18 @@ If the lidar ever stops sending to the broadcast:
   `/livox/imu`; ~25 % of one core. The relay's bridge kept its 200 000 points/s meanwhile.
 - FAST-LIO2: IMU initialised, map built, `/Odometry` published; standing still, the position
   stayed within ~2 cm of zero.
-- Not yet: walking, drift against tape, CPU under load, Nav2.
+- Against Unitree's leg odometry, same runs (2026-11-11, driven with the remote):
+
+  | Ground truth | FAST-LIO2 | Unitree |
+  |---|---|---|
+  | 2 m straight, tape | 1.93 m | 1.62 m |
+  | half turn in place and back, put back on the start (≤ 2 cm) | 4 cm off | 33 cm off |
+
+  `config/fastlio_g1.yaml` is the one that did it: `blind` 1.4 m (the head lidar sees its own
+  legs and feet ~1.25 m away; with 0.5 it got lost turning in place), `extrinsic_est_en` false
+  (the IMU is inside the lidar), map/scan filters 0.3 m for indoors. CPU ~19 % of a core each
+  for the driver and FAST-LIO2.
+- Open: **while turned round**, FAST-LIO2 and Unitree differ by ~0.6 m (a rigid 0.31 m lever
+  arm fits it to 3 cm) and nobody measured which is right there; back at the start heading
+  FAST-LIO2 is right. The pose is in the lidar's frame, which is upside down (yaw sign
+  flipped): Nav2 needs the lidar → body transform.
