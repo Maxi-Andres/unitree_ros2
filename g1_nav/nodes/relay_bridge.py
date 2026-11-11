@@ -13,7 +13,7 @@
     /cmd_vel    geometry_msgs/Twist from Nav2 -> the relay's POST /walk/move, which it accepts
                 ONLY during a walk it handed to Nav2 (its clamp and 1 s dead-man still hold; the
                 operator's stop and drive pad cancel that walk and Nav2's goal with it)
-    HTTP        127.0.0.1:BRIDGE_PORT (8094), the relay's token: how the relay hands Nav2 a walk
+    HTTP        127.0.0.1:BRIDGE_PORT (8095), the relay's token: how the relay hands Nav2 a walk
                 (its WALK_NAV2_URL) — GET /status, POST /goto {dx, dy, dyaw}, /plan, /cancel —
                 so the app's Navigation page and agent drive Nav2 through /walk/control unchanged
 
@@ -51,7 +51,7 @@ import relay_parse as rp
 
 RELAY_URL = os.environ.get("RELAY_URL", "http://127.0.0.1:8092")
 TOKEN_FILE = os.environ.get("RELAY_TOKEN_FILE", os.path.expanduser("~/.relay_token"))
-BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8094"))
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8095"))   # 8094: the video pipeline
 RETRY_S = 2.0
 ODOM_FRESH_S = 0.5
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")

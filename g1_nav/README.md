@@ -63,7 +63,7 @@ If the lidar ever stops sending to the broadcast:
 
 `./g1_nav/nav.sh` starts Nav2 with Unitree's leg odometry and the relay's obstacle map
 (`nodes/relay_bridge.py`, `config/nav2_g1.yaml`, `config/navigate_wait_and_retry.xml`). The app
-drives it **without any change**: with `WALK_NAV2_URL=http://127.0.0.1:8094` in the relay's
+drives it **without any change**: with `WALK_NAV2_URL=http://127.0.0.1:8095` in the relay's
 `relay.env`, a goto from the Navigation page or the agent's `walk` is handed to Nav2 through the
 bridge's small HTTP API (127.0.0.1 only, the relay's token), and Nav2's velocity comes back to the
 relay on `POST /walk/move`, which it refuses unless such a walk runs. The operator still wins:
