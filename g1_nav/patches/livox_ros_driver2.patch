@@ -1,0 +1,14 @@
+diff --git a/src/call_back/livox_lidar_callback.cpp b/src/call_back/livox_lidar_callback.cpp
+index 653551b..bf80d7c 100644
+--- a/src/call_back/livox_lidar_callback.cpp
++++ b/src/call_back/livox_lidar_callback.cpp
+@@ -52,6 +52,9 @@ void LivoxLidarCallback::LidarInfoChangeCallback(const uint32_t handle,
+     }
+     LidarDevice *p_lidar = &(lds_lidar->lidars_[index]);
+     p_lidar->lidar_type = kLivoxLidarType;
++    // G1 (2026-11-11): publish it too. Upstream only marks lidars listed in lidar_configs as
++    // sampling, and listing ours would write its install attitude to it (shared with Unitree's PC1).
++    p_lidar->connect_state = kConnectStateSampling;
+   } else {
+     // set the lidar according to the user-defined config
+     const UserLivoxLidarConfig& config = lidar_device->livox_config;

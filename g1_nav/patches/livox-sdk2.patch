@@ -1,0 +1,52 @@
+diff --git a/sdk_core/command_handler/general_command_handler.cpp b/sdk_core/command_handler/general_command_handler.cpp
+index b99c5c9..fbaeb42 100644
+--- a/sdk_core/command_handler/general_command_handler.cpp
++++ b/sdk_core/command_handler/general_command_handler.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ //
+ // The MIT License (MIT)
+ //
+@@ -541,6 +542,12 @@ livox_status GeneralCommandHandler::QueryFwType(const uint32_t handle) {
+ }
+ 
+ void GeneralCommandHandler::UpdateLidarCfg(const ViewLidarIpInfo& view_lidar_info) {
++  // G1 (2026-11-11): LIVOX_KEEP_HOST_CFG=1 never rewrites where the lidar sends its data. Unitree's
++  // PC1 and the relay on PC2 share the Mid-360s by its broadcast destination; a master SDK that
++  // points it at itself takes it from both.
++  if (std::getenv("LIVOX_KEEP_HOST_CFG")) {
++    return;
++  }
+   std::shared_ptr<CommandHandler> cmd_handler = GetLidarCommandHandler(view_lidar_info.dev_type);
+   if (cmd_handler != nullptr && device_manager_->sdk_framework_cfg_ptr_->master_sdk) {
+     cmd_handler->UpdateLidarCfg(view_lidar_info);
+@@ -548,6 +555,13 @@ void GeneralCommandHandler::UpdateLidarCfg(const ViewLidarIpInfo& view_lidar_inf
+ }
+ 
+ void GeneralCommandHandler::UpdateLidarCfg(const uint8_t dev_type, const uint32_t handle, const uint16_t lidar_cmd_port) {
++  // G1 (2026-11-11): LIVOX_KEEP_HOST_CFG=1 never rewrites where the lidar sends its data. Unitree's
++  // PC1 and the relay on PC2 share the Mid-360s by its broadcast destination; a master SDK that
++  // points it at itself takes it from both.
++  if (std::getenv("LIVOX_KEEP_HOST_CFG")) {
++    LivoxLidarInfoChange(handle);   // as if the update succeeded: the app learns of the lidar
++    return;
++  }
+   std::shared_ptr<CommandHandler> cmd_handler = GetLidarCommandHandler(dev_type);
+   if (cmd_handler != nullptr && device_manager_->sdk_framework_cfg_ptr_->master_sdk) {
+     cmd_handler->UpdateLidarCfg(handle, lidar_cmd_port);
+diff --git a/sdk_core/device_manager.cpp b/sdk_core/device_manager.cpp
+index 7c78acd..8246866 100644
+--- a/sdk_core/device_manager.cpp
++++ b/sdk_core/device_manager.cpp
+@@ -398,7 +398,10 @@ bool DeviceManager::CreateDataSocketAndAddDelegate(const std::string& host_ip, c
+   if (host_ip == "local") {
+     sock = util::CreateSocket(port, true, true, false, "", multicast_ip);
+   } else {
+-    sock = util::CreateSocket(port, true, true, false, host_ip, multicast_ip);
++    // G1 (2026-11-11): the Mid-360s sends its points and IMU to the subnet BROADCAST so that PC1
++    // and PC2 both get them; a socket bound to host_ip alone never sees a broadcast. Data sockets
++    // bind any address (SO_REUSEADDR, as the relay's g1_lidar_bridge on the same ports).
++    sock = util::CreateSocket(port, true, true, false, multicast_ip.empty() ? "" : host_ip, multicast_ip);
+   }
+   if (sock < 0) {
+     LOG_ERROR("Add command channel faileld, can not create socket, the ip {} port {} ", host_ip.c_str(), port);
