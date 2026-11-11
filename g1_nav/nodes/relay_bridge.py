@@ -7,6 +7,8 @@
                 (GET /lidar/stream, what the app's Navigation page draws)
     /scan       sensor_msgs/LaserScan in `base_link`, the same map as 360 beams from the robot
                 (to the nearest obstacle, inf when clear) so Nav2's costmaps can also CLEAR
+    asks out loud for the way (assets/blocked_es.wav to the relay's POST /audio/say) when Nav2's
+                tree starts waiting for a blocked path (/behavior_tree_log), once per 20 s
     /cmd_vel    geometry_msgs/Twist from Nav2 -> the relay's POST /cmd `move` (its clamp, rate
                 limit and 1 s dead-man still hold; the operator's stop and drive pad win)
 
@@ -32,6 +34,7 @@ import rclpy
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.time import Time
+from nav2_msgs.msg import BehaviorTreeLog
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from tf2_ros import TransformBroadcaster
 
@@ -41,6 +44,8 @@ import relay_parse as rp
 RELAY_URL = os.environ.get("RELAY_URL", "http://127.0.0.1:8092")
 TOKEN_FILE = os.environ.get("RELAY_TOKEN_FILE", os.path.expanduser("~/.relay_token"))
 RETRY_S = 2.0
+BLOCKED_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets",
+                           "blocked_es.wav")
 
 
 def stamp(t):
@@ -59,6 +64,10 @@ class RelayBridge:
         self.cmd, self.cmd_t = None, 0.0
         self.cmd_lock = threading.Lock()
         node.create_subscription(Twist, "cmd_vel", self.on_cmd_vel, 10)
+        with open(BLOCKED_WAV, "rb") as f:
+            self.blocked_wav = f.read()
+        self.last_said = None
+        node.create_subscription(BehaviorTreeLog, "behavior_tree_log", self.on_bt_log, 10)
 
     def lines(self, route):
         """Lines of a relay stream, forever: it reconnects after any failure."""
@@ -127,6 +136,25 @@ class RelayBridge:
         with self.cmd_lock:
             self.cmd = (msg.linear.x, msg.linear.y, msg.angular.z)
             self.cmd_t = time.monotonic()
+
+    def on_bt_log(self, msg):
+        now = time.monotonic()
+        events = [(e.node_name, e.current_status) for e in msg.event_log]
+        if rp.should_say(events, now, self.last_said):
+            self.last_said = now
+            threading.Thread(target=self.say_blocked, daemon=True).start()
+
+    def say_blocked(self):
+        """The waiting phrase through the robot's speaker (the relay validates the WAV)."""
+        try:
+            req = urllib.request.Request(RELAY_URL + "/audio/say", data=self.blocked_wav,
+                                         headers={"Authorization": "Bearer " + self.token,
+                                                  "Content-Type": "audio/wav"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+            self.node.get_logger().info("asked for the way")
+        except Exception as exc:          # a voice that fails must not stop the navigation
+            self.node.get_logger().warning(f"/audio/say: {exc}")
 
     def run_cmd(self):
         """Nav2's newest velocity to the relay, rp.CMD_HZ times a second (rp.next_command)."""

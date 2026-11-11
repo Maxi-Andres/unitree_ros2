@@ -85,6 +85,19 @@ SCAN_MIN_M = 0.3
 SCAN_MAX_M = 5.5          # the relay's obstacle map reaches 6 m; a clear beam reports past this
 
 
+# ASKING FOR THE WAY (2026-11-11, the user's idea): when Nav2's tree starts waiting for a blocked
+# path, the robot says so out loud — at most once every SAY_EVERY_S, not on every retry.
+SAY_EVERY_S = 20.0
+
+
+def should_say(events, now, last_said):
+    """True when a behaviour-tree log has the Wait node going RUNNING and the robot has not
+    asked for the way in the last SAY_EVERY_S. `events` are (node_name, current_status)."""
+    if last_said is not None and now - last_said < SAY_EVERY_S:
+        return False
+    return any(name == "Wait" and status == "RUNNING" for name, status in events)
+
+
 def obstacles_to_scan(points, pose, beams=SCAN_BEAMS, rmax=SCAN_MAX_M):
     """Ranges (len `beams`, beam 0 straight ahead, counter-clockwise, robot frame) from obstacle
     points (x, y, _) in the odometry frame and the robot's pose (x, y, yaw) there. A beam with

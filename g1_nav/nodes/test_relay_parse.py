@@ -86,3 +86,11 @@ def test_scan_beams_hit_the_nearest_obstacle_in_the_robot_frame():
 def test_scan_ignores_its_own_body_and_far_things():
     r = rp.obstacles_to_scan([(0.1, 0.0, 0.5), (9.0, 0.0, 0.5)], (0.0, 0.0, 0.0))
     assert all(math.isinf(v) for v in r)
+
+
+def test_it_asks_for_the_way_when_waiting_and_not_on_every_retry():
+    waiting = [("ClearLocalCostmap", "SUCCESS"), ("Wait", "RUNNING")]
+    assert rp.should_say(waiting, 100.0, None)
+    assert not rp.should_say(waiting, 110.0, 100.0)                    # 10 s later: quiet
+    assert rp.should_say(waiting, 100.0 + rp.SAY_EVERY_S, 100.0)        # then again
+    assert not rp.should_say([("Wait", "SUCCESS"), ("FollowPath", "RUNNING")], 100.0, None)
