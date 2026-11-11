@@ -51,5 +51,14 @@ if [ "$WHAT" != "driver" ]; then
   nice -n 10 ros2 run fast_lio fastlio_mapping --ros-args \
     --params-file "$NAV_WS/config/fastlio_g1.yaml" &
   pids+=($!)
+  # FAST-LIO2 moves `body` (the lidar's IMU) inside `camera_init` (where that IMU was at the
+  # start), and the lidar is UPSIDE DOWN on the head, 0.416 m above the torso (URDF mid360_joint;
+  # the roll of 180° verified 2026-11-05). Two fixed transforms give Nav2 the usual odom ->
+  # base_link, x forward and z up: odom -> camera_init is base -> lidar at the start, and
+  # body -> base_link is its inverse. (static_transform_publisher: x y z yaw pitch roll.)
+  ros2 run tf2_ros static_transform_publisher 0.0003 0 0.416 0 0 3.14159265 odom camera_init &
+  pids+=($!)
+  ros2 run tf2_ros static_transform_publisher -0.0003 0 0.416 0 0 3.14159265 body base_link &
+  pids+=($!)
 fi
 wait

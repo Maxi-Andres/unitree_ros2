@@ -77,5 +77,13 @@ If the lidar ever stops sending to the broadcast:
   for the driver and FAST-LIO2.
 - Open: **while turned round**, FAST-LIO2 and Unitree differ by ~0.6 m (a rigid 0.31 m lever
   arm fits it to 3 cm) and nobody measured which is right there; back at the start heading
-  FAST-LIO2 is right. The pose is in the lidar's frame, which is upside down (yaw sign
-  flipped): Nav2 needs the lidar → body transform.
+  FAST-LIO2 is right. Settled the same night, crossing the keyboard commands (relay audit
+  log) with all three: **turning in place, FAST-LIO2 overstates the displacement** (~0.9 m
+  for a 90° turn, given back when turning back) while Unitree's ~0.2-0.3 m is what the user
+  saw. Forward motion and turn angles agree in all three. Suspected cause: the lidar is not
+  time-synced, so the driver stamps packets with their arrival time and the deskew is off
+  while rotating. Plan: fuse both with `robot_localization` (installed on PC2) — position from
+  FAST-LIO2, short-term motion from Unitree.
+- `run.sh` publishes `odom -> camera_init` and `body -> base_link` (the lidar upside down,
+  0.416 m above the torso), so `odom -> base_link` is the robot, x forward and z up. Checked
+  on the robot against the keyboard commands: forward is forward, a left turn is positive.
