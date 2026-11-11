@@ -94,3 +94,14 @@ def test_it_asks_for_the_way_when_waiting_and_not_on_every_retry():
     assert not rp.should_say(waiting, 110.0, 100.0)                    # 10 s later: quiet
     assert rp.should_say(waiting, 100.0 + rp.SAY_EVERY_S, 100.0)        # then again
     assert not rp.should_say([("Wait", "SUCCESS"), ("FollowPath", "RUNNING")], 100.0, None)
+
+
+def test_phrases_never_repeat_back_to_back_and_all_get_said():
+    seen, last = set(), None
+    for k in range(200):
+        i = rp.pick_phrase(5, last, rand=lambda k=k: (k * 0.37) % 1.0)
+        assert 0 <= i < 5 and i != last
+        seen.add(i)
+        last = i
+    assert seen == {0, 1, 2, 3, 4}
+    assert rp.pick_phrase(1, 0) == 0

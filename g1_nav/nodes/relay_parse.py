@@ -98,6 +98,16 @@ def should_say(events, now, last_said):
     return any(name == "Wait" and status == "RUNNING" for name, status in events)
 
 
+def pick_phrase(n, last, rand=None):
+    """Index of the phrase to say: any of `n` but `last`, so it does not repeat itself."""
+    import random
+    rand = rand or random.random
+    if n <= 1:
+        return 0
+    i = int(rand() * (n - 1))
+    return i + 1 if last is not None and i >= last else i
+
+
 def obstacles_to_scan(points, pose, beams=SCAN_BEAMS, rmax=SCAN_MAX_M):
     """Ranges (len `beams`, beam 0 straight ahead, counter-clockwise, robot frame) from obstacle
     points (x, y, _) in the odometry frame and the robot's pose (x, y, yaw) there. A beam with
