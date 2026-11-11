@@ -61,7 +61,12 @@ controller_server:
       stateful: true
     FollowPath:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
-      desired_linear_vel: 0.25
+      # ONE SPEED, the app's Slow preset. Below ~0.3 m/s the G1 marks time instead of walking,
+      # in Walk and in Run (2026-11-11: it stopped dead 0.48 m short when this controller eased
+      # down to 0.2), so nothing here may ask less while it walks: the slow-downs near the goal
+      # and near things are off. Stopping for something in the way is still
+      # max_allowed_time_to_collision, and the planner keeps the path off obstacles.
+      desired_linear_vel: 0.3
       goal_dist_tol: 0.2          # walks until this close, then only turns (< xy_goal_tolerance)
       # High on purpose. This controller limits acceleration FROM THE MEASURED speed, 0.1 s a
       # step: at 0.5 m/s^2 it asked 0.05 m/s, the G1 marks time at that, the odometry stayed
@@ -75,14 +80,13 @@ controller_server:
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: false
       transform_tolerance: 0.3
-      # Slower than ~0.1 m/s the G1 marks time instead of stepping (relay WALK_MIN_V).
-      min_approach_linear_velocity: 0.1
-      use_approach_linear_velocity_scaling: true
+      min_approach_linear_velocity: 0.3
+      use_approach_linear_velocity_scaling: false
       max_allowed_time_to_collision: 1.5
-      use_regulated_linear_velocity_scaling: true
-      use_cost_regulated_linear_velocity_scaling: true
+      use_regulated_linear_velocity_scaling: false
+      use_cost_regulated_linear_velocity_scaling: false
       regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.1
+      regulated_linear_scaling_min_speed: 0.3
       # Face the path before walking, as the relay's walk learnt (it crabbed, 2026-11-05).
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.6
