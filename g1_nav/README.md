@@ -23,6 +23,7 @@ lidar from PC1 for about a minute. Hence the patches:
 | `livox-sdk2.patch` | `LIVOX_KEEP_HOST_CFG=1` skips the host-config update and reports the lidar as if it succeeded | never rewrite where the lidar sends its data |
 | `livox-sdk2.patch` | data sockets bind any address | a socket bound to PC2's address never sees the broadcast; shares the ports with the relay's bridge (`SO_REUSEADDR` on both) |
 | `livox_ros_driver2.patch` | a lidar not listed in `lidar_configs` is published too | listing ours would make the driver write its install attitude to it |
+| `livox_ros_driver2.patch` | `LIVOX_LIDAR_CLOCK=1`: an unsynced lidar's points and IMU keep the lidar's own clock, put on the host's by the smallest delay seen | upstream stamps each packet with when the host processed it, so per-point times carry the receive jitter. **Tried 2026-11-11 against the turn-in-place error: no change** — kept because it is the more correct stamp |
 | `fast_lio.patch` | no `pcl_ros` (not in Foxy; unused by the code), PCL `filters` and `tf2_ros` linked explicitly, Foxy's service callback signature | builds on Foxy without apt |
 
 Also: **our own Livox-SDK2** is built into `~/nav_ws/livox_sdk` — Unitree's in `/usr/local` is a
@@ -80,10 +81,11 @@ If the lidar ever stops sending to the broadcast:
   FAST-LIO2 is right. Settled the same night, crossing the keyboard commands (relay audit
   log) with all three: **turning in place, FAST-LIO2 overstates the displacement** (~0.9 m
   for a 90° turn, given back when turning back) while Unitree's ~0.2-0.3 m is what the user
-  saw. Forward motion and turn angles agree in all three. Suspected cause: the lidar is not
-  time-synced, so the driver stamps packets with their arrival time and the deskew is off
-  while rotating. Plan: fuse both with `robot_localization` (installed on PC2) — position from
-  FAST-LIO2, short-term motion from Unitree.
+  saw. Forward motion and turn angles agree in all three. **Ruled out** the same night: the
+  packet timestamps (`LIVOX_LIDAR_CLOCK`, no change: 0.99 / 0.59 / 0.80 m for turns of
+  170 / 92 / 79 degrees, Unitree 0.06 / 0.05 / 0.17) and the IMU's g units (FAST-LIO2 scales
+  them). Still suspected: the IMU-to-lidar extrinsic (copied from the Mid-360, ours is a
+  Mid-360s; LI-Init calibrates it), and a floor-heavy view from the upside-down head.
 - `run.sh` publishes `odom -> camera_init` and `body -> base_link` (the lidar upside down,
   0.416 m above the torso), so `odom -> base_link` is the robot, x forward and z up. Checked
   on the robot against the keyboard commands: forward is forward, a left turn is positive.

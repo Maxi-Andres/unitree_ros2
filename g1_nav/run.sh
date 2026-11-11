@@ -21,6 +21,7 @@ set -u
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-77}"     # never Unitree's domain 0
 export ROS_LOCALHOST_ONLY=1
 export LIVOX_KEEP_HOST_CFG=1
+export LIVOX_LIDAR_CLOCK=1      # the lidar's own clock for the points and IMU (README)
 export LD_LIBRARY_PATH="$NAV_WS/livox_sdk/lib:${LD_LIBRARY_PATH:-}"   # ours, not /usr/local's
 
 lidar_host() { python3 "$RELAY/tools/livox_set_host.py" show | grep -E "0x000[67]"; }
