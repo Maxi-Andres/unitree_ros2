@@ -27,10 +27,14 @@ trap cleanup EXIT INT TERM
 
 python3 "$HERE/nodes/relay_bridge.py" &
 pids+=($!)
+# Each node named as config/nav2_g1.yaml and the lifecycle manager expect: Foxy's planner calls
+# itself `nav2_planner`, so without the rename its parameters never apply and the lifecycle
+# manager waits for a `planner_server` that is not there (seen on PC2, 2026-11-11).
 for exe in "nav2_controller controller_server" "nav2_planner planner_server" \
            "nav2_recoveries recoveries_server" "nav2_bt_navigator bt_navigator"; do
   # shellcheck disable=SC2086
-  nice -n 5 ros2 run $exe --ros-args --params-file "$PARAMS" &
+  set -- $exe
+  nice -n 5 ros2 run "$1" "$2" --ros-args -r __node:="$2" --params-file "$PARAMS" &
   pids+=($!)
 done
 ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_navigation \
