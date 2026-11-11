@@ -32,8 +32,9 @@ def parse_odom(line):
 
 
 def parse_obstacles(line):
-    """(t, [(x, y, z), ...]) from a /lidar/stream line, in the odometry frame, or None when
-    unusable: not fresh, or not in the odometry frame ("odom": 0 = the robot's own frame)."""
+    """(t, [(x, y, z), ...], (x, y, yaw)) from a /lidar/stream line — the obstacle points and the
+    robot's pose when they were seen, both in the odometry frame — or None when unusable: not
+    fresh, or not in the odometry frame ("odom": 0 = the robot's own frame)."""
     try:
         d = json.loads(line)
         if d.get("age_ms", -1) < 0 or d["age_ms"] > STALE_MS or not d.get("odom"):
@@ -41,9 +42,12 @@ def parse_obstacles(line):
         res = float(d.get("res", 0.05))
         t = float(d["t"])
         pts = [(ix * res, iy * res, OBSTACLE_Z) for ix, iy in d.get("cells", ())]
+        pose = tuple(float(v) for v in d["pose"][:3])
     except (ValueError, KeyError, TypeError):
         return None
-    return t, pts
+    if len(pose) != 3:
+        return None
+    return t, pts, pose
 
 
 def yaw_to_quat(yaw):
@@ -70,3 +74,32 @@ def next_command(cmd, cmd_t, now, stopped):
     if not stopped:
         return {"verb": "stop_move"}, True
     return None, True
+
+
+# THE OBSTACLE MAP AS A LASER SCAN, for Nav2's costmaps. The map only says where something is,
+# never where nothing is, so a costmap fed only those cells would keep a person who walked past
+# for good. A 360-beam scan from the robot — each beam to the nearest obstacle in its direction,
+# or out to SCAN_MAX_M when there is none — lets the costmap clear along every beam.
+SCAN_BEAMS = 360
+SCAN_MIN_M = 0.3
+SCAN_MAX_M = 5.5          # the relay's obstacle map reaches 6 m; a clear beam reports past this
+
+
+def obstacles_to_scan(points, pose, beams=SCAN_BEAMS, rmax=SCAN_MAX_M):
+    """Ranges (len `beams`, beam 0 straight ahead, counter-clockwise, robot frame) from obstacle
+    points (x, y, _) in the odometry frame and the robot's pose (x, y, yaw) there. A beam with
+    nothing nearer than `rmax` is inf: Nav2 reads that as clear out to its raytrace range."""
+    px, py, yaw = pose
+    c, s = math.cos(yaw), math.sin(yaw)
+    ranges = [math.inf] * beams
+    step = 2 * math.pi / beams
+    for x, y, _z in points:
+        dx, dy = x - px, y - py
+        fx, fy = c * dx + s * dy, -s * dx + c * dy           # into the robot's frame
+        r = math.hypot(fx, fy)
+        if r < SCAN_MIN_M or r > rmax:
+            continue
+        i = int(round((math.atan2(fy, fx) % (2 * math.pi)) / step)) % beams
+        if r < ranges[i]:
+            ranges[i] = r
+    return ranges

@@ -26,27 +26,28 @@ def test_odom_lines_that_cannot_be_used(bad):
 
 
 def lidar_line(**kw):
-    d = {"t": 50.0, "age_ms": 40, "odom": 1, "res": 0.1, "pose": [0, 0, 0],
+    d = {"t": 50.0, "age_ms": 40, "odom": 1, "res": 0.1, "pose": [0.5, -1.0, 0.25],
          "cells": [[10, -3], [0, 0]]}
     d.update(kw)
     return json.dumps(d)
 
 
 def test_obstacle_cells_become_points_in_the_odometry_frame():
-    t, pts = rp.parse_obstacles(lidar_line())
-    assert t == 50.0
+    t, pts, pose = rp.parse_obstacles(lidar_line())
+    assert t == 50.0 and pose == (0.5, -1.0, 0.25)
     assert pts[0] == pytest.approx((1.0, -0.3, rp.OBSTACLE_Z))
     assert len(pts) == 2
 
 
 @pytest.mark.parametrize("bad", [lidar_line(odom=0), lidar_line(age_ms=800), lidar_line(age_ms=-1),
-                                 "{", json.dumps({"age_ms": 1, "odom": 1})])
+                                 "{", json.dumps({"age_ms": 1, "odom": 1}),
+                                 lidar_line(pose=[1, 2])])
 def test_obstacle_lines_that_cannot_be_used(bad):
     assert rp.parse_obstacles(bad) is None
 
 
 def test_an_empty_map_is_still_a_map():
-    assert rp.parse_obstacles(lidar_line(cells=[])) == (50.0, [])   # clears Nav2's costmap
+    assert rp.parse_obstacles(lidar_line(cells=[]))[1] == []   # clears Nav2's costmap
 
 
 def test_yaw_quaternion():
@@ -71,3 +72,17 @@ def test_moving_again_after_a_stop():
     _, stopped = rp.next_command(None, 0.0, 10.0, stopped=False)
     body, stopped = rp.next_command((0.0, 0.0, 0.4), 10.2, 10.25, stopped)
     assert body["verb"] == "move" and not stopped
+
+
+def test_scan_beams_hit_the_nearest_obstacle_in_the_robot_frame():
+    # Robot at (1, 1) facing +y (yaw 90 deg); an obstacle 2 m in front of it, one 1 m to its left.
+    pts = [(1.0, 3.0, 0.5), (0.0, 1.0, 0.5), (1.0, 4.0, 0.5)]
+    r = rp.obstacles_to_scan(pts, (1.0, 1.0, math.pi / 2))
+    assert r[0] == pytest.approx(2.0)                 # straight ahead: the nearer of the two
+    assert r[90] == pytest.approx(1.0)                # left = +90 deg, counter-clockwise
+    assert math.isinf(r[180]) and math.isinf(r[270])  # nothing behind or right: clear
+
+
+def test_scan_ignores_its_own_body_and_far_things():
+    r = rp.obstacles_to_scan([(0.1, 0.0, 0.5), (9.0, 0.0, 0.5)], (0.0, 0.0, 0.0))
+    assert all(math.isinf(v) for v in r)

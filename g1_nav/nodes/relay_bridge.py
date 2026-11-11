@@ -5,6 +5,8 @@
     tf          odom -> base_link   the same pose
     /obstacles  sensor_msgs/PointCloud2 in `odom`, the relay's obstacle map from the Mid-360s
                 (GET /lidar/stream, what the app's Navigation page draws)
+    /scan       sensor_msgs/LaserScan in `base_link`, the same map as 360 beams from the robot
+                (to the nearest obstacle, inf when clear) so Nav2's costmaps can also CLEAR
     /cmd_vel    geometry_msgs/Twist from Nav2 -> the relay's POST /cmd `move` (its clamp, rate
                 limit and 1 s dead-man still hold; the operator's stop and drive pad win)
 
@@ -18,6 +20,7 @@ Unitree's DDS bus: ROS2 stays local (ROS_LOCALHOST_ONLY, its own domain, see run
 """
 import http.client
 import json
+import math
 import os
 import struct
 import sys
@@ -29,7 +32,7 @@ import rclpy
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.time import Time
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from tf2_ros import TransformBroadcaster
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,6 +54,7 @@ class RelayBridge:
             self.token = f.read().strip()
         self.odom_pub = node.create_publisher(Odometry, "odom", 10)
         self.obst_pub = node.create_publisher(PointCloud2, "obstacles", 2)
+        self.scan_pub = node.create_publisher(LaserScan, "scan", 2)
         self.tf = TransformBroadcaster(node)
         self.cmd, self.cmd_t = None, 0.0
         self.cmd_lock = threading.Lock()
@@ -99,7 +103,7 @@ class RelayBridge:
             got = rp.parse_obstacles(line)
             if got is None:
                 continue
-            t, pts = got
+            t, pts, pose = got
             msg = PointCloud2()
             msg.header.stamp = stamp(t)
             msg.header.frame_id = "odom"
@@ -109,6 +113,14 @@ class RelayBridge:
             msg.is_dense = True
             msg.data = b"".join(struct.pack("<fff", *p) for p in pts)
             self.obst_pub.publish(msg)
+            scan = LaserScan()
+            scan.header.stamp = msg.header.stamp
+            scan.header.frame_id = "base_link"
+            scan.angle_min, scan.angle_increment = 0.0, 2 * math.pi / rp.SCAN_BEAMS
+            scan.angle_max = scan.angle_increment * (rp.SCAN_BEAMS - 1)
+            scan.range_min, scan.range_max = rp.SCAN_MIN_M, rp.SCAN_MAX_M
+            scan.ranges = rp.obstacles_to_scan(pts, pose)
+            self.scan_pub.publish(scan)
 
 
     def on_cmd_vel(self, msg):
