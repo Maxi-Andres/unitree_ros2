@@ -17,7 +17,7 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-77}"     # never Unitree's domain 0
 export ROS_LOCALHOST_ONLY=1
 export OPENBLAS_NUM_THREADS=1                   # numpy on the Jetson otherwise spins ~4 cores
 
-PARAMS="$HERE/config/nav2_g1.yaml"
+PARAMS="${NAV2_PARAMS:-$HERE/config/nav2_g1.yaml}"     # another file to try a change
 pids=()
 cleanup() {
   kill "${pids[@]}" 2>/dev/null || true
