@@ -105,3 +105,28 @@ def test_phrases_never_repeat_back_to_back_and_all_get_said():
         last = i
     assert seen == {0, 1, 2, 3, 4}
     assert rp.pick_phrase(1, 0) == 0
+
+
+def test_a_relative_goal_lands_in_odom():
+    x, y, yaw = rp.goal_from_relative((1.0, 2.0, math.pi / 2), 1.0, 0.5, math.pi)
+    assert (x, y) == pytest.approx((0.5, 3.0))          # facing +y: forward is +y, left is -x
+    assert yaw == pytest.approx(-math.pi / 2)            # wrapped
+
+
+def test_nav_state_words():
+    assert [rp.nav_state(c) for c in (4, 5, 6, 99)] == ["succeeded", "canceled", "aborted",
+                                                         "aborted"]
+
+
+def test_paths_are_thinned_for_the_page_keeping_both_ends():
+    pts = [(i * 0.05, 0.0) for i in range(500)]
+    out = rp.downsample_path(pts)
+    assert len(out) == rp.PATH_MAX_POINTS
+    assert out[0] == [0.0, 0.0] and out[-1] == [24.95, 0.0]
+    assert rp.downsample_path([(0, 0), (1, 1)]) == [[0, 0], [1, 1]]
+
+
+def test_blocked_follows_the_tree():
+    assert rp.blocked_after([("ClearLocalCostmap", "RUNNING"), ("Wait", "RUNNING")], False)
+    assert not rp.blocked_after([("Wait", "SUCCESS"), ("FollowPath", "RUNNING")], True)
+    assert rp.blocked_after([("ComputePathToPose", "SUCCESS")], True)       # unchanged

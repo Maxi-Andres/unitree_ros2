@@ -126,3 +126,42 @@ def obstacles_to_scan(points, pose, beams=SCAN_BEAMS, rmax=SCAN_MAX_M):
         if r < ranges[i]:
             ranges[i] = r
     return ranges
+
+
+# THE BRIDGE'S HTTP API for the relay (WALK_NAV2_URL): the relay hands it a goto relative to the
+# robot, follows its state, and asks it for plans. Helpers for that, here so they are tested.
+NAV_STATES = {4: "succeeded", 5: "canceled", 6: "aborted"}   # action_msgs GoalStatus codes
+PATH_MAX_POINTS = 120          # what the page draws; Nav2's path has a point every 5 cm
+
+
+def goal_from_relative(pose, dx, dy, dyaw):
+    """(x, y, yaw) in odom of a goal dx forward, dy left and dyaw left of `pose` (x, y, yaw)."""
+    x, y, yaw = pose
+    c, s = math.cos(yaw), math.sin(yaw)
+    return x + c * dx - s * dy, y + s * dx + c * dy, math.atan2(math.sin(yaw + dyaw),
+                                                                math.cos(yaw + dyaw))
+
+
+def nav_state(status_code):
+    """The bridge's state word for a finished NavigateToPose goal's status code."""
+    return NAV_STATES.get(status_code, "aborted")
+
+
+def downsample_path(points, max_n=PATH_MAX_POINTS):
+    """At most max_n of `points` [[x, y], ...], evenly, always keeping the first and the last."""
+    pts = [[round(x, 3), round(y, 3)] for x, y in points]
+    if len(pts) <= max_n:
+        return pts
+    step = (len(pts) - 1) / (max_n - 1)
+    return [pts[round(i * step)] for i in range(max_n)]
+
+
+def blocked_after(events, blocked):
+    """Whether Nav2 is waiting for a blocked way after these behaviour-tree events (node_name,
+    current_status): the Wait node running says yes, the path being followed again says no."""
+    for name, status in events:
+        if name == "Wait" and status == "RUNNING":
+            blocked = True
+        elif name == "FollowPath" and status == "RUNNING":
+            blocked = False
+    return blocked

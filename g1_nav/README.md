@@ -59,6 +59,19 @@ ros2 topic echo /livox/lidar --no-arr
 If the lidar ever stops sending to the broadcast:
 `python3 ~/robot-command-relay/tools/livox_set_host.py set 192.168.123.255`.
 
+## Nav2 (`nav.sh`) and the app
+
+`./g1_nav/nav.sh` starts Nav2 with Unitree's leg odometry and the relay's obstacle map
+(`nodes/relay_bridge.py`, `config/nav2_g1.yaml`, `config/navigate_wait_and_retry.xml`). The app
+drives it **without any change**: with `WALK_NAV2_URL=http://127.0.0.1:8094` in the relay's
+`relay.env`, a goto from the Navigation page or the agent's `walk` is handed to Nav2 through the
+bridge's small HTTP API (127.0.0.1 only, the relay's token), and Nav2's velocity comes back to the
+relay on `POST /walk/move`, which it refuses unless such a walk runs. The operator still wins:
+any command or stop cancels the walk and Nav2's goal. Blocked by someone, it stops, asks for
+the way out loud ("Disculpe.", "Permiso."…, `assets/`), waits 3 s and tries again, up to ~1.5
+min. One speed, 0.3 m/s (the app's Slow): below it the G1 marks time. Walk or Run is the
+operator's (the page's choice is applied before the walk is handed over).
+
 ## Measured (2026-11-11, first light)
 
 - Driver: `/livox/lidar` (CustomMsg, per-point time, ~17 800 points a message at 10 Hz) and
