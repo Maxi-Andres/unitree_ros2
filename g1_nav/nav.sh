@@ -34,7 +34,11 @@ for exe in "nav2_controller controller_server" "nav2_planner planner_server" \
            "nav2_recoveries recoveries_server" "nav2_bt_navigator bt_navigator"; do
   # shellcheck disable=SC2086
   set -- $exe
-  nice -n 5 ros2 run "$1" "$2" --ros-args -r __node:="$2" --params-file "$PARAMS" &
+  extra=()
+  if [ "$2" = bt_navigator ]; then
+    extra=(-p "default_bt_xml_filename:=${NAV2_BT:-$HERE/config/navigate_wait_and_retry.xml}")
+  fi
+  nice -n 5 ros2 run "$1" "$2" --ros-args -r __node:="$2" --params-file "$PARAMS" "${extra[@]}" &
   pids+=($!)
 done
 ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_navigation \

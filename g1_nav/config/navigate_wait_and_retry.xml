@@ -1,0 +1,23 @@
+<!--
+  The G1's behaviour tree for Nav2 (Foxy). Replan at 1 Hz and follow the path; when that fails
+  (someone stepped in front: "detected collision ahead"), the ONLY recovery is to stand still:
+  clear the local costmap, wait 3 s, and try again — up to 10 times (~40 s), then give up.
+  Never spin or back up blind: a humanoid does neither safely without looking (2026-11-11, a
+  person in the way made the stock replanning-only tree abort the goal at once).
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="10" name="NavigateWaitAndRetry">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        </RateController>
+        <FollowPath path="{path}" controller_id="FollowPath"/>
+      </PipelineSequence>
+      <Sequence name="StandAndWait">
+        <ClearEntireCostmap name="ClearLocalCostmap" service_name="local_costmap/clear_entirely_local_costmap"/>
+        <Wait wait_duration="3"/>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

@@ -4,8 +4,9 @@
 # relay's own map from the Mid-360s, both brought into ROS by nodes/relay_bridge.py (/odom,
 # odom -> base_link, /scan); Nav2's /cmd_vel goes back through the same bridge to the relay's
 # `move`, whose clamp, rate limit and 1 s dead-man still hold. Both costmaps roll with the
-# robot in `odom`. No recovery behaviours: a humanoid that is stuck stops and waits instead of
-# spinning or backing up blind (behavior tree: replan at 1 Hz, follow the path).
+# robot in `odom`. The only recovery is to stand and wait: a humanoid that is stuck stops,
+# waits 3 s and tries again (up to 10 times) instead of spinning or backing up blind
+# (config/navigate_wait_and_retry.xml).
 
 bt_navigator:
   ros__parameters:
@@ -15,6 +16,7 @@ bt_navigator:
     odom_topic: /odom
     bt_loop_duration: 10
     default_server_timeout: 20
+    # Set by nav.sh to config/navigate_wait_and_retry.xml (its path depends on where the repo is).
     default_bt_xml_filename: /opt/ros/foxy/share/nav2_bt_navigator/behavior_trees/navigate_w_replanning_time.xml
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
