@@ -52,14 +52,17 @@ controller_server:
       movement_time_allowance: 20.0
     goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
-      # 15 cm and ~15 degrees: a G1 step is longer than the 6 cm the relay's own walk once
-      # wanted, and chasing finer made it rock back and forth (2026-11-11).
-      xy_goal_tolerance: 0.15
-      yaw_goal_tolerance: 0.25
+      # 25 cm and ~20 degrees: a G1 step is longer than the 6 cm the relay's own walk once
+      # wanted, and chasing finer made it rock back and forth (2026-11-11). MUST stay above the
+      # controller's goal_dist_tol below: at 15 here and 25 there, the controller stopped
+      # walking 25 cm short to turn on the spot, and this never saw it arrive (2026-11-11).
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.35
       stateful: true
     FollowPath:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       desired_linear_vel: 0.25
+      goal_dist_tol: 0.2          # walks until this close, then only turns (< xy_goal_tolerance)
       # High on purpose. This controller limits acceleration FROM THE MEASURED speed, 0.1 s a
       # step: at 0.5 m/s^2 it asked 0.05 m/s, the G1 marks time at that, the odometry stayed
       # at 0, and it asked 0.05 again for good (2026-11-11, first goal). The G1's own
