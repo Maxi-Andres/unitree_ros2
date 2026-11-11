@@ -12,3 +12,38 @@ index 653551b..bf80d7c 100644
    } else {
      // set the lidar according to the user-defined config
      const UserLivoxLidarConfig& config = lidar_device->livox_config;
+diff --git a/src/comm/pub_handler.cpp b/src/comm/pub_handler.cpp
+index e33d588..5c7a46e 100644
+--- a/src/comm/pub_handler.cpp
++++ b/src/comm/pub_handler.cpp
+@@ -271,7 +271,29 @@ uint64_t PubHandler::GetEthPacketTimestamp(uint8_t timestamp_type, uint8_t* time
+     return time.stamp;
+   }
+ 
+-  return std::chrono::high_resolution_clock::now().time_since_epoch().count();
++  const uint64_t now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
++  // G1 (2026-11-11): LIVOX_LIDAR_CLOCK=1 keeps the LIDAR's own clock for an unsynced lidar.
++  // Upstream stamps each packet with when this host got round to it, so the per-point times
++  // FAST-LIO2 deskews with carry the receive jitter, and turning in place it read ~0.9 m of
++  // motion that was not there. The lidar's counter (ns since it powered on) is exact; it is
++  // put on this host's clock by the smallest host-minus-lidar difference seen (a delay only
++  // ever adds), let creep up 10 ns a packet so a slowly drifting clock is followed.
++  static const bool use_lidar_clock = std::getenv("LIVOX_LIDAR_CLOCK") != nullptr;
++  if (!use_lidar_clock) {
++    return now;
++  }
++  static std::mutex m;
++  static bool have = false;
++  static int64_t offset = 0;
++  const int64_t d = static_cast<int64_t>(now) - static_cast<int64_t>(time.stamp);
++  std::lock_guard<std::mutex> lock(m);
++  if (!have || d < offset + 10) {
++    offset = d;
++    have = true;
++  } else {
++    offset += 10;
++  }
++  return static_cast<uint64_t>(static_cast<int64_t>(time.stamp) + offset);
+ }
+ 
+ /*******************************/
