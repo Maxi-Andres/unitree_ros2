@@ -157,7 +157,7 @@ def downsample_path(points, max_n=PATH_MAX_POINTS):
 
 
 # BLOCKED AT THE GOAL IS ARRIVED (2026-11-12, first walk from the app): 29 cm from a goal set
-# near furniture, Foxy's pure-pursuit controller kept seeing a "collision ahead" — it projects
+# near a wall, Foxy's pure-pursuit controller kept seeing a "collision ahead" — it projects
 # the velocity 1.5 s on, PAST the end of the path — so the tree waited, retried and asked for
 # the way for ever, until the operator cancelled. Stopped that close, the walk is done: the
 # relay's own check (NAV2_OK_POS, 0.3 m) accepts it, the same as its own walk's stall rule.
