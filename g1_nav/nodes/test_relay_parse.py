@@ -130,3 +130,16 @@ def test_blocked_follows_the_tree():
     assert rp.blocked_after([("ClearLocalCostmap", "RUNNING"), ("Wait", "RUNNING")], False)
     assert not rp.blocked_after([("Wait", "SUCCESS"), ("FollowPath", "RUNNING")], True)
     assert rp.blocked_after([("ComputePathToPose", "SUCCESS")], True)       # unchanged
+
+
+def test_arrived_blocked_within_reach_of_the_goal():
+    # 2026-11-12: stuck 0.287 m from the goal, "collision ahead" past its end, for ever.
+    assert rp.arrived_blocked((0.0, 0.0, 0.0), (0.287, 0.0, 0.0))
+    assert rp.arrived_blocked((1.0, 1.0, 0.0), (1.2, 1.2, 3.0))        # yaw is not looked at
+
+
+def test_arrived_blocked_not_when_far_or_unknown():
+    assert not rp.arrived_blocked((0.0, 0.0, 0.0), (0.31, 0.0, 0.0))
+    assert not rp.arrived_blocked((0.0, 0.0, 0.0), (2.0, 0.0, 0.0))    # a person mid-way: wait
+    assert not rp.arrived_blocked(None, (0.0, 0.0, 0.0))                 # odometry stale
+    assert not rp.arrived_blocked((0.0, 0.0, 0.0), None)                 # no goal running

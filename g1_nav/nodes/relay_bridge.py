@@ -85,6 +85,7 @@ class RelayBridge:
         self.nav_lock = threading.Lock()
         self.goal_handle, self.nav = None, {"state": "idle", "blocked": False, "path": None,
                                             "reason": None}
+        self.goal = None                    # (x, y, yaw) in odom of the running goal
         self.navigate = ActionClient(node, NavigateToPose, "navigate_to_pose")
         self.planner = ActionClient(node, ComputePathToPose, "compute_path_to_pose")
         node.create_subscription(Path, "plan", self.on_plan, 2)
@@ -164,6 +165,19 @@ class RelayBridge:
         events = [(e.node_name, e.current_status) for e in msg.event_log]
         with self.nav_lock:
             self.nav["blocked"] = rp.blocked_after(events, self.nav["blocked"])
+            done = (self.nav["blocked"] and self.nav["state"] == "running"
+                    and rp.arrived_blocked(self.fresh_pose(), self.goal))
+            handle = self.goal_handle if done else None
+            if done:
+                # Blocked right at the goal: arrived (rp.ARRIVED_BLOCKED_M). Forget the handle
+                # first, so its "canceled" result does not overwrite this.
+                self.goal_handle = None
+                self.nav.update(state="succeeded", blocked=False,
+                                reason="stopped within reach of the goal: something just past it")
+        if handle is not None:
+            handle.cancel_goal_async()
+            self.node.get_logger().info("blocked at the goal: arrived")
+            return
         if rp.should_say(events, now, self.last_said):
             self.last_said = now
             threading.Thread(target=self.say_blocked, daemon=True).start()
@@ -266,7 +280,7 @@ class RelayBridge:
             return 503, {"ok": False, "error": "Nav2 did not accept the goal"}
         handle = fut.result()
         with self.nav_lock:
-            self.goal_handle = handle
+            self.goal_handle, self.goal = handle, (x, y, yaw)
             self.nav = {"state": "running", "blocked": False, "path": None, "reason": None}
         handle.get_result_async().add_done_callback(lambda f, h=handle: self.on_result(h, f))
         self.node.get_logger().info(f"goal from the relay: {dx:.2f} m fwd, {dy:.2f} m left")

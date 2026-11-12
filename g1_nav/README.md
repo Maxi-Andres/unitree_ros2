@@ -69,7 +69,8 @@ bridge's small HTTP API (127.0.0.1 only, the relay's token), and Nav2's velocity
 relay on `POST /walk/move`, which it refuses unless such a walk runs. The operator still wins:
 any command or stop cancels the walk and Nav2's goal. Blocked by someone, it stops, asks for
 the way out loud ("Disculpe.", "Permiso."…, `assets/`), waits 3 s and tries again, up to ~1.5
-min. One speed, 0.3 m/s (the app's Slow): below it the G1 marks time. Walk or Run is the
+min. Blocked within 0.3 m of the goal counts as arrived (Foxy's controller sees a
+"collision" past the path's end when the goal is near furniture). One speed, 0.3 m/s (the app's Slow): below it the G1 marks time. Walk or Run is the
 operator's (the page's choice is applied before the walk is handed over).
 
 At boot it is started by `systemd/g1-nav.service` (install steps in the file). Without it,

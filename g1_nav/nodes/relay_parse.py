@@ -156,6 +156,21 @@ def downsample_path(points, max_n=PATH_MAX_POINTS):
     return [pts[round(i * step)] for i in range(max_n)]
 
 
+# BLOCKED AT THE GOAL IS ARRIVED (2026-11-12, first walk from the app): 29 cm from a goal set
+# near furniture, Foxy's pure-pursuit controller kept seeing a "collision ahead" — it projects
+# the velocity 1.5 s on, PAST the end of the path — so the tree waited, retried and asked for
+# the way for ever, until the operator cancelled. Stopped that close, the walk is done: the
+# relay's own check (NAV2_OK_POS, 0.3 m) accepts it, the same as its own walk's stall rule.
+ARRIVED_BLOCKED_M = 0.3
+
+
+def arrived_blocked(pose, goal, max_m=ARRIVED_BLOCKED_M):
+    """True when the robot at `pose` (x, y, _) is within max_m of `goal` (x, y, _)."""
+    if pose is None or goal is None:
+        return False
+    return math.hypot(goal[0] - pose[0], goal[1] - pose[1]) <= max_m
+
+
 def blocked_after(events, blocked):
     """Whether Nav2 is waiting for a blocked way after these behaviour-tree events (node_name,
     current_status): the Wait node running says yes, the path being followed again says no."""
