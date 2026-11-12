@@ -1,0 +1,34 @@
+# Nav2 for the G1 on PC2 (g1_nav/nav.sh), started at boot so the app's Navigation page and the
+# agent's `walk` find it without anyone logging in (2026-11-12: after a power cycle the relay came
+# up with WALK_NAV2_URL set but nothing listened on 8095, so every walk fell back to the relay's own).
+#
+#   sudo cp ~/unitree_ros2/g1_nav/systemd/g1-nav.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now g1-nav
+#
+# Nav2 moves the robot only through the relay: its velocity goes to the relay's POST /walk/move,
+# which is refused unless a walk asked for on /walk/control is running, and the operator's stop
+# or drive pad cancels it. Booting with this unit never makes the robot walk by itself.
+# The relay's streams may not be ready yet at boot: relay_bridge reconnects to them forever.
+[Unit]
+Description=G1 Nav2 (leg odometry + the relay's obstacle map), driven by the relay
+After=network-online.target robot-command-relay.service
+Wants=network-online.target robot-command-relay.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+User=unitree
+WorkingDirectory=/home/unitree/unitree_ros2/g1_nav
+ExecStart=/home/unitree/unitree_ros2/g1_nav/nav.sh
+Restart=always
+RestartSec=10
+# nav.sh traps TERM and stops its nodes; the relay then sees Nav2 gone and uses its own walk.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# Never ahead of the robot's control stack or the relay (CPUWeight 100): a weight, not a quota
+# (robot-command-relay.service says why a quota froze the arm).
+CPUWeight=50
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

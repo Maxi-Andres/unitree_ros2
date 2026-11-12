@@ -72,6 +72,9 @@ the way out loud ("Disculpe.", "Permiso."…, `assets/`), waits 3 s and tries ag
 min. One speed, 0.3 m/s (the app's Slow): below it the G1 marks time. Walk or Run is the
 operator's (the page's choice is applied before the walk is handed over).
 
+At boot it is started by `systemd/g1-nav.service` (install steps in the file). Without it,
+nothing listens on 8095 and the relay falls back to its own walk.
+
 ## Measured (2026-11-11, first light)
 
 - Driver: `/livox/lidar` (CustomMsg, per-point time, ~17 800 points a message at 10 Hz) and
