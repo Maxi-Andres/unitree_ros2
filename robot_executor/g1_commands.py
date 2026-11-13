@@ -205,6 +205,13 @@ ARM_ACTION_IDS = {
     "forward_push": 36,
 }
 
+# The app's own arm actions that have no arm-service id: SetFsmId(550000 + code), as the app
+# sends them (codes read off the bus; robot-command-relay/src/g1_command_sender.cpp sends the
+# same). 565 is what the app calls "High five clap" — it is not the clap (17): "clap" sent it
+# over the relay until 2026-11-13.
+APP_ARM_ACTIONS = {"high_five_clap": 565}
+APP_ACTION_FSM_BASE = 550000
+
 # Named "teach" routines (the app's dances). Different api: ExecuteAction by NAME.
 CUSTOM_ACTIONS = ("Waist_Drum_Dance", "Scratch_head", "Spin_discs", "Throw_money")
 
@@ -325,6 +332,9 @@ def resolve(skill, params):
     # --- Preset arm actions (ExecuteAction on the arm topic) --------------- #
     if skill == "arm_action":
         action = params.get("action") or "release_arm"
+        if action in APP_ARM_ACTIONS:
+            return {"kind": "single", "pub": SPORT, "api_id": SET_FSM_ID_API_ID,
+                    "parameter": {"data": APP_ACTION_FSM_BASE + APP_ARM_ACTIONS[action]}}
         if action not in ARM_ACTION_IDS:
             return {"kind": "unsupported", "reason": f"unknown arm action '{action}'"}
         return {"kind": "single", "pub": ARM, "api_id": ARM_EXECUTE_ACTION_API_ID,

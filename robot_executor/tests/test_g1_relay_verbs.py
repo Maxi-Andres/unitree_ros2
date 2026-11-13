@@ -51,6 +51,8 @@ def test_what_misbehaved_or_takes_a_number_never_reaches_the_relay(skill, monkey
 @pytest.mark.parametrize("params,verb", [
     ({"action": "hug"}, "action_hug"), ({"action": "shake_hand"}, "action_shake_hand"),
     ({"action": "high_wave"}, "arm_high_wave"),
+    # 2026-11-13: "clap" sent the app's 565, its "High five clap"; the clap is the arm's 17.
+    ({"action": "clap"}, "arm_clap"), ({"action": "high_five_clap"}, "action_clap"),
 ])
 def test_g1_arm_actions_pick_their_own_verb(params, verb, monkeypatch):
     t, sent = g1_transport(monkeypatch)

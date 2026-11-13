@@ -1446,13 +1446,16 @@ class RelayTransport(RobotTransport):
         "zero_torque": "zero_torque",
         "shake_hand": "action_shake_hand",
         # The app's actions (FSM 550 + code, read off the bus) where they were watched; the
-        # arm service's ids for the rest. high_five is left out on purpose.
+        # arm service's ids for the rest. high_five is left out on purpose. The app's 565 is
+        # its "High five clap", not a clap: "clap" sent it from the pad and the agent
+        # (2026-11-13), so clap is the arm service's own (17) and 565 high_five_clap.
         "arm_action": {"action": {
-            **{a: f"action_{a}" for a in ("hug", "clap", "face_wave", "left_kiss", "heart",
+            **{a: f"action_{a}" for a in ("hug", "face_wave", "left_kiss", "heart",
                                           "hands_up", "x_ray", "right_hand_up", "reject",
                                           "shake_hand")},
+            "high_five_clap": "action_clap",
             **{a: f"arm_{a}" for a in ("release_arm", "turn_back_wave", "two_hand_kiss",
-                                       "right_kiss", "right_heart", "high_wave",
+                                       "right_kiss", "right_heart", "high_wave", "clap",
                                        "box_win_left", "box_win_right", "box_win_both",
                                        "hand_on_heart", "hands_up_right", "forward_push")},
         }},
